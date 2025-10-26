@@ -31,9 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata_support: None,
     };
 
-    println!("Connecting to ws://localhost:8080/resonate...");
+    println!("Connecting to ws://localhost:8927/resonate...");
 
-    let _client = ProtocolClient::connect("ws://localhost:8080/resonate", hello).await?;
+    let _client = ProtocolClient::connect("ws://localhost:8927/resonate", hello).await?;
 
     println!("Connected! Waiting for server hello...");
 
