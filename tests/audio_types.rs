@@ -1,4 +1,4 @@
-use resonate::audio::{Sample, Codec, AudioFormat};
+use resonate::audio::{AudioFormat, Codec, Sample};
 
 #[test]
 fn test_sample_from_i16() {

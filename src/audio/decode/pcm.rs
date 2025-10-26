@@ -1,16 +1,18 @@
 // ABOUTME: PCM decoder implementation
 // ABOUTME: Supports 16-bit and 24-bit PCM decoding with zero-copy where possible
 
-use crate::audio::Sample;
 use crate::audio::decode::Decoder;
+use crate::audio::Sample;
 use crate::error::Error;
 use std::sync::Arc;
 
+/// PCM audio decoder supporting 16-bit and 24-bit formats
 pub struct PcmDecoder {
     bit_depth: u8,
 }
 
 impl PcmDecoder {
+    /// Create a new PCM decoder with the specified bit depth (16 or 24)
     pub fn new(bit_depth: u8) -> Self {
         Self { bit_depth }
     }
@@ -38,7 +40,10 @@ impl Decoder for PcmDecoder {
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
-            _ => Err(Error::Protocol(format!("Unsupported bit depth: {}", self.bit_depth))),
+            _ => Err(Error::Protocol(format!(
+                "Unsupported bit depth: {}",
+                self.bit_depth
+            ))),
         }
     }
 }

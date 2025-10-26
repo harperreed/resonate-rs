@@ -6,9 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Clock synchronization quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncQuality {
-    Good,      // RTT < 50ms
-    Degraded,  // RTT 50-100ms
-    Lost,      // RTT > 100ms or no sync
+    /// Good synchronization (RTT < 50ms)
+    Good,
+    /// Degraded synchronization (RTT 50-100ms)
+    Degraded,
+    /// Lost synchronization (RTT > 100ms or no sync)
+    Lost,
 }
 
 /// Clock synchronization state
@@ -25,6 +28,7 @@ pub struct ClockSync {
 }
 
 impl ClockSync {
+    /// Create a new clock synchronization instance
     pub fn new() -> Self {
         Self {
             rtt_micros: None,

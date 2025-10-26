@@ -1,8 +1,8 @@
 // ABOUTME: Basic example demonstrating WebSocket connection and handshake
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
 
-use resonate::protocol::messages::{ClientHello, DeviceInfo, PlayerSupport, AudioFormatSpec};
 use resonate::protocol::client::ProtocolClient;
+use resonate::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,14 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             software_version: "0.1.0".to_string(),
         },
         player_support: Some(PlayerSupport {
-            support_formats: vec![
-                AudioFormatSpec {
-                    codec: "pcm".to_string(),
-                    channels: 2,
-                    sample_rate: 48000,
-                    bit_depth: 24,
-                }
-            ],
+            support_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
             buffer_capacity: 100,
             supported_commands: vec!["play".to_string(), "pause".to_string()],
         }),

@@ -7,8 +7,8 @@ fn test_clock_sync_rtt_calculation() {
 
     // Simulate sync: client sends at 1000µs, server receives at 500µs (server loop time)
     let t1 = 1_000_000; // Client transmitted (Unix µs)
-    let t2 = 500_000;   // Server received (server loop µs)
-    let t3 = 500_010;   // Server transmitted (server loop µs)
+    let t2 = 500_000; // Server received (server loop µs)
+    let t3 = 500_010; // Server transmitted (server loop µs)
     let t4 = 1_000_050; // Client received (Unix µs)
 
     sync.update(t1, t2, t3, t4);

@@ -11,8 +11,11 @@ use std::time::Instant;
 pub struct Sample(pub i32);
 
 impl Sample {
-    pub const MAX: Self = Self(8_388_607);   // 2^23 - 1
-    pub const MIN: Self = Self(-8_388_608);  // -2^23
+    /// Maximum valid 24-bit sample value (2^23 - 1)
+    pub const MAX: Self = Self(8_388_607);
+    /// Minimum valid 24-bit sample value (-2^23)
+    pub const MIN: Self = Self(-8_388_608);
+    /// Zero sample value
     pub const ZERO: Self = Self(0);
 
     /// Convert from 16-bit sample (shift left 8 bits)
@@ -28,9 +31,9 @@ impl Sample {
         let val = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i32) << 16);
         // Sign-extend from 24-bit to 32-bit
         let extended = if val & 0x00800000 != 0 {
-            val | 0xFF000000u32 as i32  // Negative: fill upper 8 bits with 1
+            val | 0xFF000000u32 as i32 // Negative: fill upper 8 bits with 1
         } else {
-            val  // Positive: upper 8 bits already 0
+            val // Positive: upper 8 bits already 0
         };
         Self(extended)
     }
@@ -51,26 +54,39 @@ impl Sample {
 /// Audio codec type
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Codec {
+    /// Uncompressed PCM audio
     Pcm,
+    /// Opus compressed audio
     Opus,
+    /// FLAC lossless compressed audio
     Flac,
+    /// MP3 compressed audio
     Mp3,
 }
 
 /// Audio format specification
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioFormat {
+    /// Audio codec used
     pub codec: Codec,
+    /// Sample rate in Hz (e.g., 48000)
     pub sample_rate: u32,
+    /// Number of audio channels (1 = mono, 2 = stereo)
     pub channels: u8,
+    /// Bit depth per sample (16 or 24)
     pub bit_depth: u8,
+    /// Optional codec-specific header data
     pub codec_header: Option<Vec<u8>>,
 }
 
 /// Audio buffer with timestamp (zero-copy via Arc)
 pub struct AudioBuffer {
-    pub timestamp: i64,           // Server loop microseconds
-    pub play_at: Instant,         // Computed local playback time
-    pub samples: Arc<[Sample]>,   // Immutable, shareable sample data
+    /// Server loop timestamp in microseconds
+    pub timestamp: i64,
+    /// Computed local playback time
+    pub play_at: Instant,
+    /// Immutable, shareable sample data
+    pub samples: Arc<[Sample]>,
+    /// Audio format specification
     pub format: AudioFormat,
 }

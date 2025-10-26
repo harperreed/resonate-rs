@@ -1,4 +1,4 @@
-use resonate::audio::decode::{PcmDecoder, Decoder};
+use resonate::audio::decode::{Decoder, PcmDecoder};
 
 #[test]
 fn test_decode_pcm_16bit() {

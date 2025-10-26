@@ -1,4 +1,6 @@
-use resonate::protocol::messages::{ClientHello, ServerHello, Message, DeviceInfo, PlayerSupport, AudioFormatSpec};
+use resonate::protocol::messages::{
+    AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerSupport, ServerHello,
+};
 use serde_json;
 
 #[test]
@@ -14,14 +16,12 @@ fn test_client_hello_serialization() {
             software_version: "0.1.0".to_string(),
         },
         player_support: Some(PlayerSupport {
-            support_formats: vec![
-                AudioFormatSpec {
-                    codec: "pcm".to_string(),
-                    channels: 2,
-                    sample_rate: 48000,
-                    bit_depth: 24,
-                }
-            ],
+            support_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
             buffer_capacity: 100,
             supported_commands: vec!["play".to_string(), "pause".to_string()],
         }),
