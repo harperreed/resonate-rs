@@ -7,8 +7,8 @@ pub mod audio;
 pub mod protocol;
 pub mod sync;
 
-// pub use protocol::client::ProtocolClient;
-// pub use protocol::messages::{ClientHello, ServerHello};
+pub use protocol::client::ProtocolClient;
+pub use protocol::messages::{ClientHello, ServerHello};
 
 /// Result type for resonate operations
 pub type Result<T> = std::result::Result<T, error::Error>;
