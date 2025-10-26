@@ -4,7 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod audio;
-// pub mod protocol;
+pub mod protocol;
 // pub mod sync;
 
 // pub use protocol::client::ProtocolClient;
