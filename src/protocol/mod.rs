@@ -6,4 +6,5 @@ pub mod client;
 /// Protocol message type definitions and serialization
 pub mod messages;
 
+pub use client::WsSender;
 pub use messages::Message;

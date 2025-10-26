@@ -44,10 +44,13 @@ impl ClockSync {
     /// t4 = client_received (Unix µs)
     pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
         // RTT = (t4 - t1) - (t3 - t2)
-        self.rtt_micros = Some((t4 - t1) - (t3 - t2));
+        let rtt = (t4 - t1) - (t3 - t2);
+        self.rtt_micros = Some(rtt);
 
-        // Server loop start = t4 - t3
-        self.server_loop_start_unix = Some(t4 - t3);
+        // Server loop start in Unix time, accounting for network delay
+        // At server time t3, the Unix time was approximately t4 - (rtt/2)
+        // So server loop started at: (t4 - rtt/2) - t3
+        self.server_loop_start_unix = Some(t4 - t3 - (rtt / 2));
 
         self.last_update = Some(Instant::now());
     }

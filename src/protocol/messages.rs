@@ -73,6 +73,12 @@ pub struct DeviceInfo {
 pub struct PlayerSupport {
     /// List of supported codecs (e.g., ["pcm", "opus"])
     pub support_codecs: Vec<String>,
+    /// List of supported channel counts (e.g., [1, 2] for mono and stereo)
+    pub support_channels: Vec<u8>,
+    /// List of supported sample rates (e.g., [44100, 48000, 96000])
+    pub support_sample_rates: Vec<u32>,
+    /// List of supported bit depths (e.g., [16, 24, 32])
+    pub support_bit_depth: Vec<u8>,
     /// List of supported audio formats
     pub support_formats: Vec<AudioFormatSpec>,
     /// Buffer capacity in chunks

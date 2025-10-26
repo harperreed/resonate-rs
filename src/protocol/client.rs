@@ -14,6 +14,24 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+/// WebSocket sender wrapper for sending messages
+pub struct WsSender {
+    tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+}
+
+impl WsSender {
+    /// Send a message to the server
+    pub async fn send_message(&self, msg: Message) -> Result<(), Error> {
+        let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
+        log::debug!("Sending message: {}", json);
+
+        let mut tx = self.tx.lock().await;
+        tx.send(WsMessage::Text(json))
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))
+    }
+}
+
 /// Audio chunk from server (binary frame)
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -46,12 +64,10 @@ impl AudioChunk {
 
 /// WebSocket client for Resonate protocol
 pub struct ProtocolClient {
-    #[allow(dead_code)]
     ws_tx:
         Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
     audio_rx: UnboundedReceiver<AudioChunk>,
     message_rx: UnboundedReceiver<Message>,
-    #[allow(dead_code)]
     clock_sync: Arc<tokio::sync::Mutex<ClockSync>>,
 }
 
@@ -160,13 +176,27 @@ impl ProtocolClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
-                    if let Ok(chunk) = AudioChunk::from_bytes(&data) {
-                        let _ = audio_tx.send(chunk);
+                    log::debug!("Received binary frame ({} bytes)", data.len());
+                    match AudioChunk::from_bytes(&data) {
+                        Ok(chunk) => {
+                            log::debug!("Parsed audio chunk: timestamp={}, data_len={}", chunk.timestamp, chunk.data.len());
+                            let _ = audio_tx.send(chunk);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse audio chunk: {}", e);
+                        }
                     }
                 }
                 Ok(WsMessage::Text(text)) => {
-                    if let Ok(msg) = serde_json::from_str::<Message>(&text) {
-                        let _ = message_tx.send(msg);
+                    log::debug!("Received text message: {}", text);
+                    match serde_json::from_str::<Message>(&text) {
+                        Ok(msg) => {
+                            log::debug!("Parsed message: {:?}", msg);
+                            let _ = message_tx.send(msg);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse message: {}", e);
+                        }
                     }
                 }
                 Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
@@ -195,6 +225,22 @@ impl ProtocolClient {
         self.message_rx.recv().await
     }
 
+    /// Send a message to the server
+    pub async fn send_message(&self, msg: &Message) -> Result<(), Error> {
+        let json = serde_json::to_string(msg).map_err(|e| Error::Protocol(e.to_string()))?;
+        log::debug!("Sending message: {}", json);
+
+        let mut tx = self.ws_tx.lock().await;
+        tx.send(WsMessage::Text(json))
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))
+    }
+
+    /// Get reference to clock sync
+    pub fn clock_sync(&self) -> Arc<tokio::sync::Mutex<ClockSync>> {
+        Arc::clone(&self.clock_sync)
+    }
+
     /// Split into separate receivers for concurrent processing
     ///
     /// This allows using tokio::select! to process messages and audio chunks concurrently
@@ -204,7 +250,14 @@ impl ProtocolClient {
     ) -> (
         UnboundedReceiver<Message>,
         UnboundedReceiver<AudioChunk>,
+        Arc<tokio::sync::Mutex<ClockSync>>,
+        WsSender,
     ) {
-        (self.message_rx, self.audio_rx)
+        (
+            self.message_rx,
+            self.audio_rx,
+            self.clock_sync,
+            WsSender { tx: self.ws_tx },
+        )
     }
 }

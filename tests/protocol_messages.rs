@@ -17,6 +17,9 @@ fn test_client_hello_serialization() {
         },
         player_support: Some(PlayerSupport {
             support_codecs: vec!["pcm".to_string()],
+            support_channels: vec![2],
+            support_sample_rates: vec![48000],
+            support_bit_depth: vec![16, 24],
             support_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,

@@ -37,6 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         player_support: Some(PlayerSupport {
             support_codecs: vec!["pcm".to_string()],
+            support_channels: vec![2], // Stereo
+            support_sample_rates: vec![48000, 96000, 192000],
+            support_bit_depth: vec![16, 24],
             support_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,
