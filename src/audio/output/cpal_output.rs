@@ -6,14 +6,14 @@ use crate::audio::{AudioFormat, Sample};
 use crate::error::Error;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 /// cpal-based audio output
 pub struct CpalOutput {
     format: AudioFormat,
     _stream: Stream,
-    sample_tx: Sender<Arc<[Sample]>>,
+    sample_tx: SyncSender<Arc<[Sample]>>,
     latency_micros: Arc<Mutex<u64>>,
 }
 
@@ -31,7 +31,8 @@ impl CpalOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let (sample_tx, sample_rx) = channel::<Arc<[Sample]>>();
+        // Use bounded channel for backpressure (10 buffers max = ~200ms at 20ms chunks)
+        let (sample_tx, sample_rx) = sync_channel::<Arc<[Sample]>>(10);
         let latency_micros = Arc::new(Mutex::new(0u64));
         let latency_clone = Arc::clone(&latency_micros);
 

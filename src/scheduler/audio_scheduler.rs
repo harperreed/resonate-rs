@@ -36,16 +36,17 @@ impl AudioScheduler {
 
     /// Get next buffer that's ready to play (within 50ms window)
     pub fn next_ready(&self) -> Option<AudioBuffer> {
+        // Take the lock once and do all operations under it
+        let mut sorted = self.sorted.lock();
+
         // Drain incoming queue into sorted vec
         while let Some(buf) = self.incoming.pop() {
-            let mut sorted = self.sorted.lock();
             let pos = sorted
                 .binary_search_by_key(&buf.timestamp, |b| b.timestamp)
                 .unwrap_or_else(|e| e);
             sorted.insert(pos, buf);
         }
 
-        let mut sorted = self.sorted.lock();
         let now = Instant::now();
 
         // Check if first buffer is ready

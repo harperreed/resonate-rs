@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const BUFFERING_TARGET: usize = 25; // Buffer 25 chunks (~500ms) before starting playback
 
     loop {
-        // Process messages sequentially to avoid borrow conflicts
+        // Process messages first
         if let Some(msg) = client.recv_message().await {
             match msg {
                 Message::StreamStart(stream_start) => {
@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Process audio chunks
+        // Then process audio chunks
         if let Some(chunk) = client.recv_audio_chunk().await {
             if let (Some(ref dec), Some(ref fmt)) = (&decoder, &audio_format) {
                 match dec.decode(&chunk.data) {
@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // If both channels are closed, break
+        // Both channels closed
         break;
     }
 
