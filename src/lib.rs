@@ -16,9 +16,12 @@ pub mod audio;
 pub mod protocol;
 /// Clock synchronization utilities
 pub mod sync;
+/// Audio scheduler for timed playback
+pub mod scheduler;
 
 pub use protocol::client::ProtocolClient;
 pub use protocol::messages::{ClientHello, ServerHello};
+pub use scheduler::AudioScheduler;
 
 /// Result type for resonate operations
 pub type Result<T> = std::result::Result<T, error::Error>;

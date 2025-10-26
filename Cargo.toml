@@ -27,6 +27,12 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 # Audio output
 cpal = "0.15"
 
+# Concurrency
+crossbeam = "0.8"
+
+# Fast mutexes
+parking_lot = "0.12"
+
 [dev-dependencies]
 tokio-test = "0.4"
 env_logger = "0.11"
