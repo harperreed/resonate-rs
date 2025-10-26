@@ -5,7 +5,7 @@
 
 pub mod audio;
 pub mod protocol;
-// pub mod sync;
+pub mod sync;
 
 // pub use protocol::client::ProtocolClient;
 // pub use protocol::messages::{ClientHello, ServerHello};
