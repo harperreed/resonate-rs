@@ -45,5 +45,9 @@ pub mod error {
         /// Connection-related error
         #[error("Connection error: {0}")]
         Connection(String),
+
+        /// Audio output error
+        #[error("Audio output error: {0}")]
+        Output(String),
     }
 }

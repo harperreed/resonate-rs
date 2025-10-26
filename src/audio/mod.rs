@@ -3,7 +3,10 @@
 
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
+/// Audio output trait and implementations
+pub mod output;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
 
 pub use types::{AudioBuffer, AudioFormat, Codec, Sample};
+pub use output::{AudioOutput, CpalOutput};
