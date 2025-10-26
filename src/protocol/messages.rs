@@ -71,6 +71,8 @@ pub struct DeviceInfo {
 /// Player capabilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSupport {
+    /// List of supported codecs (e.g., ["pcm", "opus"])
+    pub support_codecs: Vec<String>,
     /// List of supported audio formats
     pub support_formats: Vec<AudioFormatSpec>,
     /// Buffer capacity in chunks

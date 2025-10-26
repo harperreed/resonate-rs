@@ -70,29 +70,65 @@ impl ProtocolClient {
         let hello_json =
             serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
 
+        log::debug!("Sending client/hello: {}", hello_json);
+
         write
             .send(WsMessage::Text(hello_json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
-        // Wait for server hello
+        // Wait for server hello (handle Ping/Pong first)
         let mut read_temp = read;
-        if let Some(Ok(WsMessage::Text(text))) = read_temp.next().await {
-            let msg: Message =
-                serde_json::from_str(&text).map_err(|e| Error::Protocol(e.to_string()))?;
+        log::debug!("Waiting for server/hello...");
 
-            match msg {
-                Message::ServerHello(server_hello) => {
-                    log::info!(
-                        "Connected to server: {} ({})",
-                        server_hello.name,
-                        server_hello.server_id
-                    );
+        loop {
+            if let Some(result) = read_temp.next().await {
+                match result {
+                    Ok(WsMessage::Text(text)) => {
+                        log::debug!("Received text message: {}", text);
+                        let msg: Message =
+                            serde_json::from_str(&text).map_err(|e| {
+                                log::error!("Failed to parse server message: {}", e);
+                                Error::Protocol(e.to_string())
+                            })?;
+
+                        match msg {
+                            Message::ServerHello(server_hello) => {
+                                log::info!(
+                                    "Connected to server: {} ({})",
+                                    server_hello.name,
+                                    server_hello.server_id
+                                );
+                                break; // Exit loop, we got the server/hello
+                            }
+                            _ => {
+                                log::error!("Expected server/hello, got: {:?}", msg);
+                                return Err(Error::Protocol("Expected server/hello".to_string()));
+                            }
+                        }
+                    }
+                    Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
+                        // Ping/Pong are handled automatically by tokio-tungstenite
+                        log::debug!("Received Ping/Pong, continuing to wait for server/hello");
+                        continue;
+                    }
+                    Ok(WsMessage::Close(_)) => {
+                        log::error!("Server closed connection");
+                        return Err(Error::Connection("Server closed connection".to_string()));
+                    }
+                    Ok(other) => {
+                        log::warn!("Unexpected message type while waiting for hello: {:?}", other);
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("WebSocket error: {}", e);
+                        return Err(Error::WebSocket(e.to_string()));
+                    }
                 }
-                _ => return Err(Error::Protocol("Expected server/hello".to_string())),
+            } else {
+                log::error!("Connection closed before receiving server/hello");
+                return Err(Error::Connection("No server hello received".to_string()));
             }
-        } else {
-            return Err(Error::Connection("No server hello received".to_string()));
         }
 
         // Create channels for message routing
