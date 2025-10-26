@@ -6,7 +6,7 @@ pub mod cpal_output;
 
 pub use cpal_output::CpalOutput;
 
-use crate::audio::{Sample, AudioFormat};
+use crate::audio::{AudioFormat, Sample};
 use crate::error::Error;
 use std::sync::Arc;
 

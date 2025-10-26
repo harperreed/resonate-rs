@@ -1,7 +1,7 @@
+use resonate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
 use resonate::scheduler::AudioScheduler;
-use resonate::audio::{AudioBuffer, Sample, AudioFormat, Codec};
 use std::sync::Arc;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_scheduler_creation() {

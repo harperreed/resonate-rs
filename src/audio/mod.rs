@@ -10,6 +10,6 @@ pub mod pool;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
 
-pub use types::{AudioBuffer, AudioFormat, Codec, Sample};
 pub use output::{AudioOutput, CpalOutput};
 pub use pool::BufferPool;
+pub use types::{AudioBuffer, AudioFormat, Codec, Sample};

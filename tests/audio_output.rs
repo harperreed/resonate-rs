@@ -1,5 +1,5 @@
-use resonate::audio::{Sample, AudioFormat, Codec};
 use resonate::audio::output::{AudioOutput, CpalOutput};
+use resonate::audio::{AudioFormat, Codec, Sample};
 use std::sync::Arc;
 
 #[test]

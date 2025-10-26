@@ -1,13 +1,13 @@
 // ABOUTME: cpal-based audio output implementation
 // ABOUTME: Cross-platform audio output using the cpal library
 
-use crate::audio::{Sample, AudioFormat};
 use crate::audio::output::AudioOutput;
+use crate::audio::{AudioFormat, Sample};
 use crate::error::Error;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender, Receiver};
 
 /// cpal-based audio output
 pub struct CpalOutput {
@@ -62,7 +62,9 @@ impl CpalOutput {
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     for sample_out in data.iter_mut() {
                         // Get next sample from current buffer or receive new buffer
-                        if current_buffer.is_none() || buffer_pos >= current_buffer.as_ref().unwrap().len() {
+                        if current_buffer.is_none()
+                            || buffer_pos >= current_buffer.as_ref().unwrap().len()
+                        {
                             // Try to get new buffer
                             if let Ok(rx) = sample_rx.lock() {
                                 if let Ok(buf) = rx.try_recv() {

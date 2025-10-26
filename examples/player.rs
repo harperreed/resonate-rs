@@ -1,10 +1,12 @@
 // ABOUTME: End-to-end player example
 // ABOUTME: Connects to server, receives audio, and plays it back
 
+use resonate::audio::decode::{Decoder, PcmDecoder};
+use resonate::audio::{AudioBuffer, AudioFormat, AudioOutput, Codec, CpalOutput};
 use resonate::protocol::client::ProtocolClient;
-use resonate::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport, Message};
-use resonate::audio::{CpalOutput, AudioOutput, AudioFormat, Codec, AudioBuffer};
-use resonate::audio::decode::{PcmDecoder, Decoder};
+use resonate::protocol::messages::{
+    AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerSupport,
+};
 use resonate::scheduler::AudioScheduler;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,11 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(msg) = client.recv_message().await {
             match msg {
                 Message::StreamStart(stream_start) => {
-                    println!("Stream starting: {} {}Hz {}ch {}bit",
+                    println!(
+                        "Stream starting: {} {}Hz {}ch {}bit",
                         stream_start.player.codec,
                         stream_start.player.sample_rate,
                         stream_start.player.channels,
-                        stream_start.player.bit_depth);
+                        stream_start.player.bit_depth
+                    );
 
                     audio_format = Some(AudioFormat {
                         codec: Codec::Pcm,

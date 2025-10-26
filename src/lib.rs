@@ -14,10 +14,10 @@
 pub mod audio;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
-/// Clock synchronization utilities
-pub mod sync;
 /// Audio scheduler for timed playback
 pub mod scheduler;
+/// Clock synchronization utilities
+pub mod sync;
 
 pub use protocol::client::ProtocolClient;
 pub use protocol::messages::{ClientHello, ServerHello};

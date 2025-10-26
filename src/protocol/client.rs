@@ -2,14 +2,17 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
-use crate::protocol::messages::{Message, ClientHello};
+use crate::protocol::messages::{ClientHello, Message};
 use crate::sync::ClockSync;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Audio chunk from server (binary frame)
 #[derive(Debug, Clone)]
@@ -32,8 +35,7 @@ impl AudioChunk {
         }
 
         let timestamp = i64::from_be_bytes([
-            frame[1], frame[2], frame[3], frame[4],
-            frame[5], frame[6], frame[7], frame[8],
+            frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8],
         ]);
 
         let data = Arc::from(&frame[9..]);
@@ -45,7 +47,8 @@ impl AudioChunk {
 /// WebSocket client for Resonate protocol
 pub struct ProtocolClient {
     #[allow(dead_code)]
-    ws_tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    ws_tx:
+        Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
     audio_rx: UnboundedReceiver<AudioChunk>,
     message_rx: UnboundedReceiver<Message>,
     #[allow(dead_code)]
@@ -64,23 +67,27 @@ impl ProtocolClient {
 
         // Send client hello
         let hello_msg = Message::ClientHello(hello);
-        let hello_json = serde_json::to_string(&hello_msg)
-            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let hello_json =
+            serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
 
-        write.send(WsMessage::Text(hello_json))
+        write
+            .send(WsMessage::Text(hello_json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
         // Wait for server hello
         let mut read_temp = read;
         if let Some(Ok(WsMessage::Text(text))) = read_temp.next().await {
-            let msg: Message = serde_json::from_str(&text)
-                .map_err(|e| Error::Protocol(e.to_string()))?;
+            let msg: Message =
+                serde_json::from_str(&text).map_err(|e| Error::Protocol(e.to_string()))?;
 
             match msg {
                 Message::ServerHello(server_hello) => {
-                    log::info!("Connected to server: {} ({})",
-                        server_hello.name, server_hello.server_id);
+                    log::info!(
+                        "Connected to server: {} ({})",
+                        server_hello.name,
+                        server_hello.server_id
+                    );
                 }
                 _ => return Err(Error::Protocol("Expected server/hello".to_string())),
             }

@@ -36,9 +36,9 @@ impl BufferPool {
 
     /// Get a buffer from the pool (or allocate if pool is empty)
     pub fn get(&self) -> Vec<Sample> {
-        self.pool.pop().unwrap_or_else(|| {
-            Vec::with_capacity(self.capacity)
-        })
+        self.pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.capacity))
     }
 
     /// Return a buffer to the pool
