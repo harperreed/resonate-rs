@@ -5,8 +5,11 @@
 pub mod decode;
 /// Audio output trait and implementations
 pub mod output;
+/// Buffer pool for reusing audio sample buffers
+pub mod pool;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
 
 pub use types::{AudioBuffer, AudioFormat, Codec, Sample};
 pub use output::{AudioOutput, CpalOutput};
+pub use pool::BufferPool;
