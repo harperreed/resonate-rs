@@ -1,3 +1,7 @@
+> [!WARNING]  
+> THIS IS A WIP. Please help!
+
+
 # resonate-rs
 
 Hyper-efficient Rust implementation of the [Resonate Protocol](https://github.com/resonate-protocol/spec) for synchronized multi-room audio streaming.
