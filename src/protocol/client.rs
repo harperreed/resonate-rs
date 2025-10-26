@@ -158,4 +158,17 @@ impl ProtocolClient {
     pub async fn recv_message(&mut self) -> Option<Message> {
         self.message_rx.recv().await
     }
+
+    /// Split into separate receivers for concurrent processing
+    ///
+    /// This allows using tokio::select! to process messages and audio chunks concurrently
+    /// without borrow checker issues
+    pub fn split(
+        self,
+    ) -> (
+        UnboundedReceiver<Message>,
+        UnboundedReceiver<AudioChunk>,
+    ) {
+        (self.message_rx, self.audio_rx)
+    }
 }

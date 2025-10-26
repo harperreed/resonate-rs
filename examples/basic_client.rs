@@ -1,20 +1,37 @@
 // ABOUTME: Basic example demonstrating WebSocket connection and handshake
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
 
+use clap::Parser;
 use resonate::protocol::client::ProtocolClient;
 use resonate::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport};
+
+/// Resonate basic client
+#[derive(Parser, Debug)]
+#[command(name = "basic_client")]
+#[command(about = "Test connection to Resonate server", long_about = None)]
+struct Args {
+    /// WebSocket URL of the Resonate server
+    #[arg(short, long, default_value = "ws://localhost:8927/resonate")]
+    server: String,
+
+    /// Client name
+    #[arg(short, long, default_value = "Resonate-RS Basic Client")]
+    name: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
+    let args = Args::parse();
+
     let hello = ClientHello {
         client_id: uuid::Uuid::new_v4().to_string(),
-        name: "Resonate-RS Basic Client".to_string(),
+        name: args.name.clone(),
         version: 1,
         supported_roles: vec!["player".to_string()],
         device_info: DeviceInfo {
-            product_name: "Resonate-RS Player".to_string(),
+            product_name: args.name.clone(),
             manufacturer: "Resonate".to_string(),
             software_version: "0.1.0".to_string(),
         },
@@ -31,9 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata_support: None,
     };
 
-    println!("Connecting to ws://localhost:8927/resonate...");
+    println!("Connecting to {}...", args.server);
 
-    let _client = ProtocolClient::connect("ws://localhost:8927/resonate", hello).await?;
+    let _client = ProtocolClient::connect(&args.server, hello).await?;
 
     println!("Connected! Waiting for server hello...");
 
