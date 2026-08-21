@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/Sendspin/sendspin-rs/compare/v0.3.6...v0.3.7) - 2026-08-21
+
+### Fixed
+
+- *(clippy)* use as_chunks for PCM decoding ([#100](https://github.com/Sendspin/sendspin-rs/pull/100))
+- fix build error
+- calculation in musl targets
+
+### Other
+
+- Merge branch 'pr-99'
+- Fix clippy error on musl-linux
+- Apply suggestion from @DanielHabenicht
+- Update raw_clock.rs
+- Update time conversion in now_micros function
+- Document conversion requirement for musl targets
+
 ### Added
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
