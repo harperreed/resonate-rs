@@ -41,11 +41,15 @@ fn split_flac(bytes: &[u8]) -> (&[u8], &[u8]) {
 fn parse_expected(raw: &[u8], bits: u32) -> Vec<i32> {
     match bits {
         16 => raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (i16::from_le_bytes([c[0], c[1]]) as i32) << 16)
             .collect(),
         24 => raw
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 // Assemble the 24-bit value in the top three bytes and use an
                 // arithmetic shift back down to sign-extend it, then widen to
