@@ -60,7 +60,9 @@ impl Decoder for PcmDecoder {
         match (self.bit_depth, self.endian) {
             (16, PcmEndian::Little) => {
                 let samples: Vec<i32> = data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let i16_val = i16::from_le_bytes([c[0], c[1]]);
                         i32::from_sample(i16_val)
@@ -70,7 +72,9 @@ impl Decoder for PcmDecoder {
             }
             (16, PcmEndian::Big) => {
                 let samples: Vec<i32> = data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let i16_val = i16::from_be_bytes([c[0], c[1]]);
                         i32::from_sample(i16_val)
@@ -80,7 +84,9 @@ impl Decoder for PcmDecoder {
             }
             (24, PcmEndian::Little) => {
                 let samples: Vec<i32> = data
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let extended = i32::from_i24_le([c[0], c[1], c[2]]);
                         i32::from_sample(cpal::I24::new_unchecked(extended))
@@ -90,7 +96,9 @@ impl Decoder for PcmDecoder {
             }
             (24, PcmEndian::Big) => {
                 let samples: Vec<i32> = data
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let extended = i32::from_i24_be([c[0], c[1], c[2]]);
                         i32::from_sample(cpal::I24::new_unchecked(extended))
