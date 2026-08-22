@@ -22,12 +22,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
         .name("Minimal Test Client".to_string())
         .initial_player_state(PlayerState {
             volume: Some(100),
             muted: Some(false),
-            static_delay_ms: Some(0),
+            output_delay_ms: Some(0),
             required_lead_time_ms: Some(500),
             min_buffer_ms: Some(500),
             supported_commands: None,

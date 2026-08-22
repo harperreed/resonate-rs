@@ -27,7 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to {}...", args.server);
 
     let test = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
         .name(args.name.clone())
         .build();
 

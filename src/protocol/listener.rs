@@ -11,9 +11,6 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::{accept_async, accept_hdr_async, WebSocketStream};
 
-#[cfg(feature = "native-tls")]
-use tokio_native_tls::TlsAcceptor;
-
 /// Accept inbound WebSocket peers and drive each one through the
 /// protocol-client state machine. Construct via
 /// [`ProtocolClientBuilder::listen`].
@@ -36,7 +33,7 @@ use tokio_native_tls::TlsAcceptor;
 /// [`ConnectionManager`], which runs inbound handshakes concurrently,
 /// applies the spec keep-or-switch policy ([`should_switch`]), and sends
 /// [`GoodbyeReason::AnotherServer`] to losers automatically. To run the
-/// policy yourself instead: read [`ProtocolClient::server_hello`] for
+/// policy yourself instead: read [`ProtocolClient::session`] for
 /// `server_id` and `connection_reason`, decide with [`should_switch`]
 /// against your persisted last-played server, and send the loser's goodbye.
 /// This listener itself does not enforce a policy.
@@ -55,8 +52,6 @@ pub struct ProtocolListener {
     tcp: TcpListener,
     template: ProtocolClientBuilder,
     path: Option<String>,
-    #[cfg(feature = "native-tls")]
-    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl std::fmt::Debug for ProtocolListener {
@@ -66,8 +61,6 @@ impl std::fmt::Debug for ProtocolListener {
         let mut s = f.debug_struct("ProtocolListener");
         s.field("local_addr", &self.tcp.local_addr().ok());
         s.field("path", &self.path);
-        #[cfg(feature = "native-tls")]
-        s.field("tls", &self.tls_acceptor.is_some());
         s.finish()
     }
 }
@@ -78,8 +71,6 @@ impl ProtocolListener {
             tcp,
             template,
             path: None,
-            #[cfg(feature = "native-tls")]
-            tls_acceptor: None,
         }
     }
 
@@ -99,22 +90,6 @@ impl ProtocolListener {
             format!("/{path}")
         });
         self
-    }
-
-    /// Terminate TLS on every accepted connection using the given identity.
-    /// The identity is fixed for the listener's lifetime — to rotate
-    /// certificates, rebind. For mTLS, custom ALPN, or any other
-    /// non-trivial TLS need, terminate TLS yourself and use
-    /// [`ProtocolClientBuilder::accept`] instead.
-    ///
-    /// Unlike [`Self::path`] this returns `Result`, so chain it last:
-    /// `listener.path("/x").tls(id)?`.
-    #[cfg(feature = "native-tls")]
-    pub fn tls(mut self, identity: native_tls::Identity) -> Result<Self, Error> {
-        let acceptor = native_tls::TlsAcceptor::new(identity)
-            .map_err(|e| Error::Connection(format!("TLS acceptor build failed: {e}")))?;
-        self.tls_acceptor = Some(TlsAcceptor::from(acceptor));
-        Ok(self)
     }
 
     /// Accept the next inbound connection, returning the driven
@@ -164,18 +139,6 @@ impl ProtocolListener {
         &self,
         tcp_stream: TcpStream,
     ) -> Result<ProtocolClient, Error> {
-        // Branched (rather than unified through a trait-object stream)
-        // so the WS handshake is monomorphized on the concrete transport.
-        #[cfg(feature = "native-tls")]
-        if let Some(tls) = &self.tls_acceptor {
-            let tls_stream = tls
-                .accept(tcp_stream)
-                .await
-                .map_err(|e| Error::Connection(format!("TLS handshake failed: {e}")))?;
-            let ws = self.handshake_ws(tls_stream).await?;
-            return self.template.clone().accept(ws).await;
-        }
-
         let ws = self.handshake_ws(tcp_stream).await?;
         self.template.clone().accept(ws).await
     }

@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 pub type ProcessCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
 /// Maximum static delay in milliseconds. The Sendspin protocol defines
-/// `static_delay_ms` over 0–5000; larger values are clamped to this.
-pub const MAX_STATIC_DELAY_MS: u16 = 5000;
+/// `output_delay_ms` over 0–5000; larger values are clamped to this.
+pub const MAX_OUTPUT_DELAY_MS: u16 = 5000;
 
 /// Configuration for [`SyncedPlayer`] construction.
 pub struct SyncedPlayerConfig {
@@ -77,12 +77,12 @@ impl Default for SyncedPlayerConfig {
     }
 }
 
-/// Convert a protocol `static_delay_ms` value to microseconds, clamping to
-/// [`MAX_STATIC_DELAY_MS`]. Out-of-range values are clamped rather than
+/// Convert a protocol `output_delay_ms` value to microseconds, clamping to
+/// [`MAX_OUTPUT_DELAY_MS`]. Out-of-range values are clamped rather than
 /// rejected so a sloppy server can't disable playback timing entirely.
-const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
-    let clamped = if delay_ms > MAX_STATIC_DELAY_MS {
-        MAX_STATIC_DELAY_MS
+const fn output_delay_ms_to_us(delay_ms: u16) -> u64 {
+    let clamped = if delay_ms > MAX_OUTPUT_DELAY_MS {
+        MAX_OUTPUT_DELAY_MS
     } else {
         delay_ms
     };
@@ -410,7 +410,7 @@ impl CallbackStats {
 struct CallbackConfig {
     gain_control: GainControl,
     process_callback: Option<ProcessCallback>,
-    static_delay_us: Arc<AtomicU64>,
+    output_delay_us: Arc<AtomicU64>,
 }
 
 struct CallbackOutputs {
@@ -425,8 +425,8 @@ pub struct SyncedPlayer {
     /// Last error from the audio stream callback, if any.
     last_error: Arc<Mutex<Option<String>>>,
     gain: GainControl,
-    /// Shared with the audio callback. See [`SyncedPlayer::set_static_delay`].
-    static_delay_us: Arc<AtomicU64>,
+    /// Shared with the audio callback. See [`SyncedPlayer::set_output_delay`].
+    output_delay_us: Arc<AtomicU64>,
 }
 
 impl SyncedPlayer {
@@ -516,12 +516,12 @@ impl SyncedPlayer {
         let format_clone = format.clone();
         let last_error = Arc::new(Mutex::new(None));
         let gain = GainControl::new(config.volume, config.muted);
-        let static_delay_us = Arc::new(AtomicU64::new(0));
+        let output_delay_us = Arc::new(AtomicU64::new(0));
 
         let cb_config = CallbackConfig {
             gain_control: gain.clone(),
             process_callback,
-            static_delay_us: Arc::clone(&static_delay_us),
+            output_delay_us: Arc::clone(&output_delay_us),
         };
         let callback_outputs = CallbackOutputs {
             error: Arc::clone(&last_error),
@@ -550,7 +550,7 @@ impl SyncedPlayer {
             queue,
             last_error,
             gain,
-            static_delay_us,
+            output_delay_us,
         })
     }
 
@@ -694,7 +694,7 @@ impl SyncedPlayer {
         self.gain.set_mute(muted);
     }
 
-    /// Set the static playback delay in milliseconds (0–[`MAX_STATIC_DELAY_MS`]).
+    /// Set the output delay in milliseconds (0–[`MAX_OUTPUT_DELAY_MS`]).
     ///
     /// Compensates for external speaker/amplifier latency: the server pre-sends
     /// audio by this amount, so the player shifts each sample's emission earlier
@@ -705,9 +705,9 @@ impl SyncedPlayer {
     /// Request a one-shot reanchor so the audio callback either skips forward or
     /// waits for the new target time instead of feeding the delay delta through
     /// pitch-shifting drift correction.
-    pub fn set_static_delay(&self, delay_ms: u16) {
-        self.static_delay_us
-            .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+    pub fn set_output_delay(&self, delay_ms: u16) {
+        self.output_delay_us
+            .store(output_delay_ms_to_us(delay_ms), Ordering::Relaxed);
 
         let mut queue = self.queue.lock();
         if queue.initialized {
@@ -716,8 +716,8 @@ impl SyncedPlayer {
     }
 
     /// Current static delay in milliseconds.
-    pub fn static_delay_ms(&self) -> u16 {
-        (self.static_delay_us.load(Ordering::Relaxed) / 1_000) as u16
+    pub fn output_delay_ms(&self) -> u16 {
+        (self.output_delay_us.load(Ordering::Relaxed) / 1_000) as u16
     }
 
     fn build_stream(
@@ -921,7 +921,7 @@ impl SyncedPlayer {
                         // below adds the same delay in the local→server
                         // direction; the two signs must stay in step or the
                         // planner chases a phantom error every callback.
-                        let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
+                        let delay_us = cb_config.output_delay_us.load(Ordering::Relaxed);
                         let mut effective_cursor_us = cursor_us;
                         let sync_settled = sync.is_settled();
                         if sync_settled && !sync_settle_logged {
@@ -1476,8 +1476,8 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
-        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        output_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
+        SyncedPlayerConfig, MAX_OUTPUT_DELAY_MS,
     };
     use crate::audio::{AudioBuffer, AudioFormat, Codec};
     use crate::error::Error;
@@ -1543,23 +1543,23 @@ mod tests {
     }
 
     #[test]
-    fn test_static_delay_ms_to_us_converts_and_clamps() {
+    fn test_output_delay_ms_to_us_converts_and_clamps() {
         // Nominal values convert milliseconds to microseconds.
-        assert_eq!(static_delay_ms_to_us(0), 0);
-        assert_eq!(static_delay_ms_to_us(100), 100_000);
+        assert_eq!(output_delay_ms_to_us(0), 0);
+        assert_eq!(output_delay_ms_to_us(100), 100_000);
         assert_eq!(
-            static_delay_ms_to_us(MAX_STATIC_DELAY_MS),
-            MAX_STATIC_DELAY_MS as u64 * 1_000
+            output_delay_ms_to_us(MAX_OUTPUT_DELAY_MS),
+            MAX_OUTPUT_DELAY_MS as u64 * 1_000
         );
 
         // Out-of-range values clamp to the maximum rather than overflow or wrap.
         assert_eq!(
-            static_delay_ms_to_us(MAX_STATIC_DELAY_MS + 1),
-            MAX_STATIC_DELAY_MS as u64 * 1_000
+            output_delay_ms_to_us(MAX_OUTPUT_DELAY_MS + 1),
+            MAX_OUTPUT_DELAY_MS as u64 * 1_000
         );
         assert_eq!(
-            static_delay_ms_to_us(u16::MAX),
-            MAX_STATIC_DELAY_MS as u64 * 1_000
+            output_delay_ms_to_us(u16::MAX),
+            MAX_OUTPUT_DELAY_MS as u64 * 1_000
         );
     }
 

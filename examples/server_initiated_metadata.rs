@@ -19,10 +19,6 @@ struct Args {
     /// Friendly name advertised in the mDNS TXT record
     #[arg(short, long, default_value = "Metadata Listener")]
     name: String,
-
-    /// Persistent client id (defaults to a random UUID)
-    #[arg(short, long)]
-    id: Option<String>,
 }
 
 #[tokio::main]
@@ -30,10 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args = Args::parse();
-    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
     let listener = ProtocolClientBuilder::builder()
-        .client_id(client_id)
         .name(args.name.clone())
         .metadata()
         .build()
@@ -69,10 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replacement.
     while let Some(mut conn) = manager.next_connection().await {
         let peer = conn.peer;
-        let server_id = conn.server_hello.server_id.clone();
+        let server_id = conn.session.server_id.clone();
         println!(
-            "[{peer}] now serving server_id={server_id} connection_reason={:?}",
-            conn.server_hello.connection_reason
+            "[{peer}] now serving server_id={server_id} trust_level={:?} activities={:?}",
+            conn.session.trust_level, conn.session.initial_activities
         );
 
         // Only `messages` is consumed: this client negotiates just the

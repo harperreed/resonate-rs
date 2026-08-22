@@ -1,11 +1,16 @@
 // ABOUTME: Builder exposed for public usage of the library
+// ABOUTME: Assembles identity, PSK candidates, and hello capabilities into a SessionConfig
 
 use crate::error::Error;
+use crate::protocol::client::SessionConfig;
+use crate::protocol::crypto::{CipherSuite, Identity, Psk, PskCandidate};
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
-    PlayerState, PlayerV1Support, VisualizerV1Support,
+    ArtworkV1Support, AudioFormatSpec, ClientState, DeviceInfo, PairMethodDescriptor,
+    PairingMethod, PlayerState, PlayerV1Support, SourceV1Support, VisualizerV1Support,
 };
+use crate::protocol::pairing::{candidates_from, MemoryPairingStore, PairingRecord, PairingStore};
+use crate::protocol::session::HelloTemplate;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
 use std::sync::Arc;
@@ -18,16 +23,22 @@ use typed_builder::TypedBuilder;
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
 pub(crate) struct ProtocolClientBuilderRaw {
-    client_id: String,
+    identity: Option<Arc<Identity>>,
+    suite: CipherSuite,
+    pairing_psk: Option<Psk>,
+    psk_records: Vec<PskCandidate>,
+    pairing_store: Option<Arc<dyn PairingStore>>,
+    unpaired_access: bool,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
     software_version: Option<String>,
     mac_address: Option<String>,
     player_v1_support: Option<PlayerV1Support>,
+    source_v1_support: Option<SourceV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
-    initial_sync_state: ClientSyncState,
+    initial_available: bool,
     initial_player_state: Option<PlayerState>,
     metadata: bool,
     controller: bool,
@@ -39,6 +50,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         // Build supported_roles based on which supports are configured
         let mut supported_roles = Vec::new();
         let has_explicit_role = raw.player_v1_support.is_some()
+            || raw.source_v1_support.is_some()
             || raw.artwork_v1_support.is_some()
             || raw.visualizer_v1_support.is_some()
             || raw.metadata
@@ -78,6 +90,9 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         if player_v1_support.is_some() {
             supported_roles.push("player@v1".to_string());
         }
+        if raw.source_v1_support.is_some() {
+            supported_roles.push("source@v1".to_string());
+        }
         if raw.artwork_v1_support.is_some() {
             supported_roles.push("artwork@v1".to_string());
         }
@@ -95,7 +110,12 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
 
         ProtocolClientBuilder {
-            client_id: raw.client_id,
+            identity: raw.identity,
+            suite: raw.suite,
+            pairing_psk: raw.pairing_psk,
+            psk_records: raw.psk_records,
+            pairing_store: raw.pairing_store,
+            unpaired_access: raw.unpaired_access,
             name: raw.name,
             product_name: raw.product_name,
             manufacturer: raw.manufacturer,
@@ -104,9 +124,10 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             supported_roles,
             player_v1_support,
             clock: Arc::new(DefaultClock::new()),
+            source_v1_support: raw.source_v1_support,
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
-            initial_sync_state: raw.initial_sync_state,
+            initial_available: raw.initial_available,
             initial_player_state: raw.initial_player_state,
         }
     }
@@ -116,8 +137,33 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
 #[builder(build_method(into = ProtocolClientBuilder))]
 /// Builder Class for ProtocolClient
 pub struct ProtocolClientBuilderFields {
-    client_id: String,
+    /// Human-readable client name
     name: String,
+    /// The client's static Curve25519 identity. Persist and reuse the secret
+    /// key across restarts so servers recognize this client; a fresh identity
+    /// is generated when omitted.
+    #[builder(default = None, setter(transform = |x: Identity| Some(Arc::new(x))))]
+    identity: Option<Arc<Identity>>,
+    /// The Noise cipher suite announced in `client/init`.
+    #[builder(default = CipherSuite::ChaChaPoly)]
+    suite: CipherSuite,
+    /// The client's Pairing PSK: offering it advertises the `pairing_psk`
+    /// method and keeps it among the handshake PSK candidates.
+    #[builder(default = None, setter(transform = |x: Psk| Some(x)))]
+    pairing_psk: Option<Psk>,
+    /// Long-term pairing-record PSK candidates (stored-pubkey or shared-PSK).
+    #[builder(default = Vec::new())]
+    psk_records: Vec<PskCandidate>,
+    /// Persistence for pairing records: existing records become handshake
+    /// candidates and newly paired records are written here. Defaults to an
+    /// in-memory store that does not survive restarts.
+    #[builder(default = None, setter(transform = |x: Arc<dyn PairingStore>| Some(x)))]
+    pairing_store: Option<Arc<dyn PairingStore>>,
+    /// Whether this client admits unpaired (Sentinel-PSK) playback sessions
+    /// at trust level `none`. Defaults to `true` for frictionless setups;
+    /// products handling sensitive inputs should disable it and pair.
+    #[builder(default = true)]
+    unpaired_access: bool,
     #[builder(default = None)]
     product_name: Option<String>,
     #[builder(default = None)]
@@ -128,14 +174,16 @@ pub struct ProtocolClientBuilderFields {
     mac_address: Option<String>,
     #[builder(default = None, setter(transform = |x: PlayerV1Support| Some(x)))]
     player_v1_support: Option<PlayerV1Support>,
+    #[builder(default = None, setter(transform = |x: SourceV1Support| Some(x)))]
+    source_v1_support: Option<SourceV1Support>,
     #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
-    /// Initial top-level operational state sent in the first `client/state`.
-    /// [`ClientSyncState::ExternalSource`] when another source owns playback.
-    #[builder(default = ClientSyncState::Synchronized)]
-    initial_sync_state: ClientSyncState,
+    /// Initial top-level availability sent in the first `client/state`.
+    /// `false` when another source owns the output at connect time.
+    #[builder(default = true)]
+    initial_available: bool,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     #[builder(default = false, setter(transform = || true))]
@@ -149,16 +197,22 @@ pub struct ProtocolClientBuilderFields {
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
     fn from(fields: ProtocolClientBuilderFields) -> Self {
         let raw = ProtocolClientBuilderRaw {
-            client_id: fields.client_id,
+            identity: fields.identity,
+            suite: fields.suite,
+            pairing_psk: fields.pairing_psk,
+            psk_records: fields.psk_records,
+            pairing_store: fields.pairing_store,
+            unpaired_access: fields.unpaired_access,
             name: fields.name,
             product_name: fields.product_name,
             manufacturer: fields.manufacturer,
             software_version: fields.software_version,
             mac_address: fields.mac_address,
             player_v1_support: fields.player_v1_support,
+            source_v1_support: fields.source_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
-            initial_sync_state: fields.initial_sync_state,
+            initial_available: fields.initial_available,
             initial_player_state: fields.initial_player_state,
             metadata: fields.metadata,
             controller: fields.controller,
@@ -171,7 +225,12 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
 /// Builder Class for ProtocolClient
 #[derive(Clone)]
 pub struct ProtocolClientBuilder {
-    client_id: String,
+    identity: Option<Arc<Identity>>,
+    suite: CipherSuite,
+    pairing_psk: Option<Psk>,
+    psk_records: Vec<PskCandidate>,
+    pairing_store: Option<Arc<dyn PairingStore>>,
+    unpaired_access: bool,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
@@ -179,9 +238,10 @@ pub struct ProtocolClientBuilder {
     mac_address: Option<String>,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
+    source_v1_support: Option<SourceV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
-    initial_sync_state: ClientSyncState,
+    initial_available: bool,
     initial_player_state: Option<PlayerState>,
     clock: Arc<dyn Clock>,
 }
@@ -223,23 +283,22 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
-        let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::connect(request, hello, initial_state, clock).await
+        let config = self.into_config()?;
+        ProtocolClient::connect(request, config).await
     }
 
     /// Adopt an already-handshaked WebSocket stream and drive the protocol
-    /// from `client/hello` onwards.
+    /// from `client/init` onwards.
     ///
-    /// Use this when you're terminating TLS, routing by HTTP path, or
-    /// otherwise need to own the WebSocket layer yourself. For the common
-    /// "bind a TCP socket and accept inbound peers" case, use
-    /// [`Self::listen`].
+    /// Use this when you're routing by HTTP path or otherwise need to own the
+    /// WebSocket layer yourself. For the common "bind a TCP socket and accept
+    /// inbound peers" case, use [`Self::listen`].
     pub async fn accept<S>(self, ws_stream: WebSocketStream<S>) -> Result<ProtocolClient, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::drive(ws_stream, hello, initial_state, clock).await
+        let config = self.into_config()?;
+        ProtocolClient::drive(ws_stream, config).await
     }
 
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
@@ -256,28 +315,85 @@ impl ProtocolClientBuilder {
         Ok(ProtocolListener::new(tcp, self))
     }
 
-    fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>) {
-        let hello = ClientHello {
-            client_id: self.client_id,
+    pub(crate) fn into_config(self) -> Result<SessionConfig, Error> {
+        let identity = match self.identity {
+            Some(identity) => identity,
+            None => Arc::new(Identity::generate()?),
+        };
+
+        let store = self
+            .pairing_store
+            .unwrap_or_else(|| Arc::new(MemoryPairingStore::new()));
+
+        // Ensure a shared-PSK record exists for `record_mode` (the spec's
+        // pre-provisioned storage-exhaustion fallback; management.md#record-mode).
+        // Done before candidate assembly so the record is a handshake candidate.
+        let record_mode = match store.records().iter().find(|r| r.server_id.is_none()) {
+            Some(shared) => shared.psk_id(),
+            None => {
+                let record = PairingRecord {
+                    psk: Psk::generate()?,
+                    server_id: None,
+                    used: false,
+                };
+                let psk_id = record.psk_id();
+                if let Err(e) = store.add_record(record) {
+                    // Degenerate (e.g. exhausted app store): the id still
+                    // names the intended fallback, but it isn't persisted.
+                    log::error!("Failed to pre-provision shared-PSK record: {e:?}");
+                }
+                psk_id
+            }
+        };
+
+        // Assemble PSK candidates: the Sentinel is always a candidate, the
+        // Pairing PSK when configured, plus stored records and any extras.
+        let mut psk_candidates = candidates_from(&store, self.pairing_psk.as_ref());
+        psk_candidates.extend(self.psk_records);
+        let pairing_psk = self.pairing_psk;
+        let mut supported_pair_methods = Vec::new();
+        if pairing_psk.is_some() {
+            supported_pair_methods.push(PairMethodDescriptor {
+                method: PairingMethod::PairingPsk,
+                out_channels: None,
+                formats: None,
+                locations: None,
+            });
+        }
+
+        let hello = HelloTemplate {
             name: self.name,
-            version: 1,
-            supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
                 product_name: self.product_name,
                 manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),
                 software_version: self.software_version,
                 mac_address: self.mac_address,
             }),
+            supported_roles: self.supported_roles,
             player_v1_support: self.player_v1_support,
+            source_v1_support: self.source_v1_support,
             artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
+            supported_pair_methods,
         };
 
         let initial_state = ClientState {
-            state: Some(self.initial_sync_state),
+            available: self.initial_available,
             player: self.initial_player_state,
+            source: None,
         };
 
-        (hello, initial_state, self.clock)
+        Ok(SessionConfig {
+            identity,
+            suite: self.suite,
+            psk_candidates,
+            store,
+            pairing_psk,
+            unpaired_access: self.unpaired_access,
+            record_mode,
+            hello,
+            initial_state,
+            clock: self.clock,
+        })
     }
 }

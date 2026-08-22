@@ -1,19 +1,20 @@
-// ABOUTME: Example demonstrating builder capabilities with custom headers
-// ABOUTME: Shows player format configuration, controller role, and auth proxy setup
-// ABOUTME: Run with: cargo run --example secure_socket --features native-tls
+// ABOUTME: Example demonstrating builder capabilities with a custom WebSocket request
+// ABOUTME: Shows auth-proxy headers, persisted identity, player format config, and controller role
+// Run with: cargo run --example custom_request
 
 use clap::Parser;
 use sendspin::protocol::messages::{AudioFormatSpec, PlayerState, PlayerV1Support};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{Identity, ProtocolClientBuilder};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Sendspin advanced client
 #[derive(Parser, Debug)]
-#[command(name = "advanced_client")]
+#[command(name = "custom_request")]
 #[command(about = "Demonstrates builder capabilities with custom headers", long_about = None)]
 struct Args {
-    /// WebSocket URL of the Sendspin server
-    #[arg(short, long, default_value = "wss://localhost:8927/sendspin")]
+    /// WebSocket URL of the Sendspin server. Per spec the transport is plain
+    /// ws:// — confidentiality comes from the mandatory Noise layer, not TLS.
+    #[arg(short, long, default_value = "ws://localhost:8927/sendspin")]
     server: String,
 
     /// Client name
@@ -29,16 +30,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
 
-    // Build a request with custom headers (e.g., for auth proxy)
-    let mut request = args.server.into_client_request().unwrap();
+    // Build a request with custom headers (e.g., for an HTTP auth proxy in
+    // front of the server). Anything implementing IntoClientRequest works;
+    // apps that need to own the transport entirely (custom TLS, HTTP
+    // routing) can instead hand a ready WebSocketStream to
+    // `ProtocolClientBuilder::accept`.
+    let mut request = args.server.into_client_request()?;
     request
         .headers_mut()
-        .insert("cookie", "ingress_session=<session_token>".parse().unwrap());
+        .insert("cookie", "ingress_session=<session_token>".parse()?);
+
+    // A real client persists its identity's secret key so servers recognize
+    // it across restarts; a fresh identity is generated here for brevity.
+    let identity = Identity::generate()?;
 
     // Configure the builder with explicit player support and controller role
     let client = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
         .name(args.name)
+        .identity(identity)
         .product_name(Some("Sendspin-RS Advanced Client".to_string()))
         .software_version(Some(env!("CARGO_PKG_VERSION").to_string()))
         // Declare player capabilities: 24-bit/48kHz stereo PCM
@@ -58,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .initial_player_state(PlayerState {
             volume: Some(80),
             muted: Some(false),
-            static_delay_ms: Some(0),
+            output_delay_ms: Some(0),
             required_lead_time_ms: Some(500),
             min_buffer_ms: Some(500),
             ..Default::default()
@@ -72,12 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Split into conn channels for concurrent use
     let conn = client.split();
 
-    if let Some(controller) = conn.controller {
-        println!("Controller role granted — can send playback commands");
-        // e.g., controller.play().await?;
-        drop(controller);
-    } else {
-        println!("Controller role not granted by server");
+    match conn.controller {
+        Some(controller) if conn.active_roles().iter().any(|r| r == "controller@v1") => {
+            println!("Controller role active — can send playback commands");
+            // e.g., controller.play().await?;
+            drop(controller);
+        }
+        Some(_) => println!("Controller declared but not activated by the server"),
+        None => println!("Controller role not declared"),
     }
 
     Ok(())
