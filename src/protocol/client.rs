@@ -221,9 +221,15 @@ impl ConnectionGuard {
 
         match tokio::time::timeout(deadline, flush).await {
             Ok(result) => {
-                // Farewell + close are flushed; tear the reader down now.
-                if let Some(h) = self.router_handle.take() {
-                    h.abort();
+                // Let the router finish its close-handshake drain (see
+                // message_router) before aborting it.
+                if let Some(mut h) = self.router_handle.take() {
+                    if tokio::time::timeout(Duration::from_secs(2), &mut h)
+                        .await
+                        .is_err()
+                    {
+                        h.abort();
+                    }
                 }
                 log::debug!("Disconnect complete");
                 result
@@ -794,10 +800,20 @@ impl ProtocolClient {
             let pairing_deadline = session.pairing_deadline;
             let frame = tokio::select! {
                 biased;
-                // The writer half died (wire-write failure): the session is
-                // over even if the read half still looks idle-healthy.
+                // Writer ended (wire failure or flushed farewell). Drain the
+                // reader until Close/EOF: dropping a socket with unread data
+                // makes Windows RST, losing the peer's copy of our goodbye.
                 _ = &mut io.writer_dead => {
                     log::info!("Writer task ended; closing session");
+                    let drain = async {
+                        while let Some(frame) = read.next().await {
+                            match frame {
+                                Ok(WsMessage::Close(_)) | Err(_) => break,
+                                _ => {}
+                            }
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
                     break 'outer;
                 }
                 _ = tokio::time::sleep_until(
