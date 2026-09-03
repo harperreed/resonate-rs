@@ -73,17 +73,13 @@ pub enum Message {
     #[serde(rename = "stream/clear")]
     StreamClear(StreamClear),
 
-    /// Client request for specific stream format
-    #[serde(rename = "stream/request-format")]
-    StreamRequestFormat(StreamRequestFormat),
-
     // === Source (client → server) stream messages ===
     /// Source input stream start (format announcement)
-    #[serde(rename = "client_stream/start")]
+    #[serde(rename = "client-stream/start")]
     ClientStreamStart(ClientStreamStart),
 
     /// Source input stream end
-    #[serde(rename = "client_stream/end")]
+    #[serde(rename = "client-stream/end")]
     ClientStreamEnd(ClientStreamEnd),
 
     // === Group messages ===
@@ -131,35 +127,6 @@ pub enum Message {
     /// Either side aborts a pairing attempt
     #[serde(rename = "pair/abort")]
     PairAbort(PairAbort),
-
-    // === Management messages ===
-    /// List the client's pairing records
-    #[serde(rename = "management/list-records")]
-    ManagementListRecords(ManagementListRecords),
-
-    /// Add a pairing record directly
-    #[serde(rename = "management/add-record")]
-    ManagementAddRecord(ManagementAddRecord),
-
-    /// Remove a pairing record
-    #[serde(rename = "management/remove-record")]
-    ManagementRemoveRecord(ManagementRemoveRecord),
-
-    /// Read the client's pairing configuration
-    #[serde(rename = "management/get-pairing-config")]
-    ManagementGetPairingConfig(ManagementGetPairingConfig),
-
-    /// Modify the client's pairing configuration
-    #[serde(rename = "management/set-pairing-config")]
-    ManagementSetPairingConfig(ManagementSetPairingConfig),
-
-    /// Open a pairing window in place of the operator gesture
-    #[serde(rename = "management/open-pairing-window")]
-    ManagementOpenPairingWindow(ManagementOpenPairingWindow),
-
-    /// Client response to a `management/*` request
-    #[serde(rename = "management/result")]
-    ManagementResult(ManagementResult),
 
     // === Connection lifecycle ===
     /// Paired server drops its own pairing record from the client
@@ -211,21 +178,29 @@ pub struct NoiseHandshake {
 pub struct NoiseMessage1Payload {
     /// 43-char base64url SHA-256 psk_id derived from the PSK
     pub psk_id: String,
+    /// The category the server is using the referenced PSK as. A `psk_id` the
+    /// client holds only under a different category is a lookup miss.
+    pub psk_category: PskCategory,
+}
+
+/// PSK category declared in Noise message 1. The codes share one length, so
+/// the encrypted payload's length is independent of the category.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum PskCategory {
+    /// Long-term PSK from a pairing record
+    #[serde(rename = "lt")]
+    LongTerm,
+    /// The client's pairing PSK
+    #[serde(rename = "pr")]
+    Pairing,
+    /// The published Sentinel PSK
+    #[serde(rename = "sn")]
+    Sentinel,
 }
 
 // =============================================================================
 // Encrypted Handshake Messages
 // =============================================================================
-
-/// Trust level the client extends to the server.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TrustLevel {
-    /// A pairing record exists for this server
-    User,
-    /// No pairing record: pairing handshakes and unpaired access
-    None,
-}
 
 /// Client hello message, sent encrypted after `server/hello`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,8 +210,6 @@ pub struct ClientHello {
     /// Device information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_info: Option<DeviceInfo>,
-    /// Trust level the client extends to this server
-    pub trust_level: TrustLevel,
     /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
     /// Player capabilities (if client supports player@v1 role)
@@ -245,17 +218,14 @@ pub struct ClientHello {
     /// Source capabilities (if client supports source@v1 role)
     #[serde(rename = "source@v1_support", skip_serializing_if = "Option::is_none")]
     pub source_v1_support: Option<SourceV1Support>,
-    /// Artwork capabilities (if client supports artwork@v1 role)
-    #[serde(rename = "artwork@v1_support", skip_serializing_if = "Option::is_none")]
-    pub artwork_v1_support: Option<ArtworkV1Support>,
     /// Visualizer capabilities (if client supports visualizer@v1 role)
     #[serde(
         rename = "visualizer@v1_support",
         skip_serializing_if = "Option::is_none"
     )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
-    /// Pairing methods this client currently offers
-    pub supported_pair_methods: Vec<PairMethodDescriptor>,
+    /// Pairing methods this client currently offers, keyed by method
+    pub supported_pair_methods: SupportedPairMethods,
     /// Whether this client currently admits unpaired access
     pub unpaired_access: UnpairedAccess,
 }
@@ -267,20 +237,62 @@ pub struct UnpairedAccess {
     pub enabled: bool,
 }
 
-/// A pairing method the client offers, with UX hints for the server.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PairMethodDescriptor {
-    /// The pairing method identifier
-    pub method: PairingMethod,
-    /// Out-channels conveying the dynamic pairing code (informational)
+/// Pairing methods the client offers, keyed by method identifier. Every
+/// client offers at least the Pairing PSK method; at most one pairing-code
+/// method may be listed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupportedPairMethods {
+    /// Pairing authenticated by the client's pairing PSK
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub out_channels: Option<Vec<PairingOutChannel>>,
-    /// Emission formats offered (required on `dynamic_pairing_code`)
+    pub pairing_psk: Option<PairingPskDescriptor>,
+    /// Fixed 8-digit pairing code (PAKE)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub formats: Option<Vec<PairingCodeFormat>>,
-    /// Where the operator can find the configured secret (informational)
+    pub static_pairing_code: Option<StaticPairingCodeDescriptor>,
+    /// Per-session pairing code bound to the Noise handshake (PAKE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicPairingCodeDescriptor>,
+}
+
+/// Descriptor for the Pairing PSK method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairingPskDescriptor {
+    /// Where the operator can find the pairing token (informational)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locations: Option<Vec<PairingSecretLocation>>,
+}
+
+/// Descriptor for the static pairing code method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaticPairingCodeDescriptor {
+    /// Where the operator can find the configured code (informational)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<PairingSecretLocation>>,
+}
+
+/// Descriptor for the dynamic pairing code method.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicPairingCodeDescriptor {
+    /// Channels through which the per-session code reaches the operator
+    pub out_channels: Vec<PairingOutChannel>,
+    /// Emission formats the client offers (non-empty)
+    pub formats: Vec<PairingCodeFormat>,
+    /// The server-supplied digit audio pack the client wants. Required when
+    /// `out_channels` includes `speaker`, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digit_audio: Option<DigitAudio>,
+}
+
+/// Digit audio pack request in a `dynamic_pairing_code` descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DigitAudio {
+    /// Codec identifier ('opus' | 'flac' | 'pcm')
+    pub codec: String,
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Bit depth; meaningful for `pcm` and `flac` only
+    pub bit_depth: u8,
+    /// Maximum total encoded size of the ten clips in bytes
+    pub max_bytes: u32,
 }
 
 /// Pairing method identifier.
@@ -335,8 +347,6 @@ pub enum Activity {
     Playback,
     /// A pairing exchange
     Pairing,
-    /// Management operations
-    Management,
 }
 
 /// Declares the server's current purpose on this connection. May be re-sent
@@ -363,9 +373,6 @@ pub struct ActivatePairing {
     /// Dynamic pairing code emission format (required for `dynamic_pairing_code`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<PairingCodeFormat>,
-    /// BCP 47 language tags in descending operator preference, for spoken emission
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub languages: Option<Vec<String>>,
 }
 
 /// Device information (all fields optional per spec)
@@ -392,8 +399,6 @@ pub struct PlayerV1Support {
     pub supported_formats: Vec<AudioFormatSpec>,
     /// Max size in bytes of compressed, not-yet-played audio messages in the buffer
     pub buffer_capacity: u32,
-    /// List of supported playback commands (subset of 'volume', 'mute')
-    pub supported_commands: Vec<String>,
 }
 
 /// Source@v1 capabilities
@@ -413,7 +418,7 @@ pub struct SourceFeatures {
 }
 
 /// Audio format specification
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioFormatSpec {
     /// Codec name (e.g., "pcm", "opus", "flac")
     pub codec: String,
@@ -425,24 +430,66 @@ pub struct AudioFormatSpec {
     pub bit_depth: u8,
 }
 
-/// Artwork@v1 capabilities
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtworkV1Support {
-    /// Supported artwork channels (1-4 channels, array index is channel number)
-    pub channels: Vec<ArtworkChannel>,
+/// Artwork state object in `client/state`: the configuration the client
+/// wants for each artwork channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkState {
+    /// Per-channel configuration, positional from channel 0 (length 1-4). A
+    /// channel index the array does not cover is `source: 'none'`.
+    pub channels: Vec<ArtworkChannelConfig>,
 }
 
-/// Artwork channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtworkChannel {
+impl ArtworkState {
+    /// Validate the channel-count bound and per-channel field requirements.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.channels.is_empty() || self.channels.len() > 4 {
+            return Err("artwork channels array must contain 1-4 entries");
+        }
+        for channel in &self.channels {
+            channel.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for one artwork channel (in `client/state` and
+/// `stream/start`). `format`, `width`, and `height` are required unless
+/// `source` is `'none'`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkChannelConfig {
     /// Artwork source type
     pub source: ArtworkSource,
-    /// Image format
-    pub format: ImageFormat,
-    /// Max width in pixels
-    pub media_width: u32,
-    /// Max height in pixels
-    pub media_height: u32,
+    /// Image format identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ImageFormat>,
+    /// Width in pixels of the delivered image
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Height in pixels of the delivered image
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl ArtworkChannelConfig {
+    /// A disabled channel (`source: 'none'`).
+    pub fn none() -> Self {
+        Self {
+            source: ArtworkSource::None,
+            format: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    /// Validate the source-dependent field requirements.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source != ArtworkSource::None
+            && (self.format.is_none() || self.width.is_none() || self.height.is_none())
+        {
+            return Err("artwork channel with a source requires format, width, and height");
+        }
+        Ok(())
+    }
 }
 
 /// Artwork source type
@@ -465,17 +512,21 @@ pub enum ImageFormat {
     Jpeg,
     /// PNG format
     Png,
-    /// BMP format
-    Bmp,
 }
 
 /// Visualizer@v1 capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualizerV1Support {
-    /// Visualization data types requested by the client.
-    pub types: Vec<VisualizerDataType>,
     /// Maximum total size of buffered visualizer messages in bytes.
     pub buffer_capacity: u32,
+}
+
+/// Visualizer state object in `client/state`: the requested data types,
+/// frame-rate cap, and spectrum configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisualizerState {
+    /// Visualization data types requested by the client.
+    pub types: Vec<VisualizerDataType>,
     /// Maximum periodic visualization frames per second.
     pub rate_max: u32,
     /// Spectrum configuration, required when `types` includes `spectrum`.
@@ -483,7 +534,7 @@ pub struct VisualizerV1Support {
     pub spectrum: Option<SpectrumConfig>,
 }
 
-impl VisualizerV1Support {
+impl VisualizerState {
     /// Validate the cross-field spectrum requirement from the Sendspin spec.
     pub fn validate(&self) -> Result<(), &'static str> {
         validate_spectrum(&self.types, self.spectrum.as_ref())
@@ -548,6 +599,10 @@ pub enum SpectrumScale {
 pub struct ServerHello {
     /// Human-readable server name
     pub name: String,
+    /// BCP 47 language tags in descending operator preference (non-empty when
+    /// present) - a hint about the languages the operator understands
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
 }
 
 // =============================================================================
@@ -576,7 +631,10 @@ pub struct ServerTime {
 // State Messages
 // =============================================================================
 
-/// Client state update message (wraps role-specific state)
+/// Client state update message (wraps role-specific state).
+///
+/// Every message carries `available` and the full state of each role object
+/// it includes; omitting a role object leaves that role's state unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientState {
     /// Whether the client is available to participate in Sendspin playback.
@@ -588,6 +646,12 @@ pub struct ClientState {
     /// Source state (if source role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceState>,
+    /// Artwork channel configuration (if artwork role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkState>,
+    /// Visualizer configuration (if visualizer role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visualizer: Option<VisualizerState>,
 }
 
 /// Source state object in `client/state`.
@@ -608,41 +672,79 @@ pub enum SourceSignal {
     Absent,
 }
 
-/// Player state
+/// Player state object in `client/state`. Every included player object
+/// carries the player's full state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlayerState {
-    /// Current volume level (0-100)
+    /// Current volume level (0-100). Must be included when `volume` is in
+    /// `supported_commands`; a player may also report it read-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
-    /// Whether audio is muted
+    /// Whether audio is muted. Must be included when `mute` is in
+    /// `supported_commands`; a player may also report it read-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
     /// Output delay in milliseconds (0-5000) to compensate for external speaker/amplifier latency
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub output_delay_ms: Option<u16>,
+    pub output_delay_ms: u16,
     /// Minimum startup lead time in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub required_lead_time_ms: Option<u32>,
+    pub required_lead_time_ms: u32,
     /// Requested minimum ongoing buffer duration in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub min_buffer_ms: Option<u32>,
-    /// Supported player state commands
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub supported_commands: Option<Vec<PlayerStateCommand>>,
+    pub min_buffer_ms: u32,
+    /// Commands the server may send; empty when the player accepts none.
+    /// Advertises settability, not reportability.
+    pub supported_commands: Vec<PlayerStateCommand>,
+    /// The format the player currently prefers (one of its
+    /// `supported_formats`). Absent means no overridden preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<AudioFormatSpec>,
+}
+
+impl PlayerState {
+    /// Validate the fields whose requirements are conditional on the player's
+    /// advertised capabilities.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.output_delay_ms > 5000 {
+            return Err("output_delay_ms must be in the range 0-5000");
+        }
+        if self
+            .supported_commands
+            .contains(&PlayerStateCommand::Volume)
+            && self.volume.is_none()
+        {
+            return Err("volume is required when supported_commands includes volume");
+        }
+        if self.supported_commands.contains(&PlayerStateCommand::Mute) && self.muted.is_none() {
+            return Err("muted is required when supported_commands includes mute");
+        }
+        Ok(())
+    }
 }
 
 /// Commands that can appear in PlayerState.supported_commands
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlayerStateCommand {
-    /// Client supports set_output_delay command
+    /// The server may set the player's volume
+    Volume,
+    /// The server may set the player's mute state
+    Mute,
+    /// The server may set the player's output delay
     SetOutputDelay,
 }
 
 /// Server state update message (metadata and controller info).
 ///
-/// Each role object distinguishes *absent* (no change, outer `None`) from
-/// *null* (clear all of that role's state, `Some(None)`).
+/// Every message carries the full state of each role object it includes;
+/// omitting a role object leaves that role's state unchanged (and any
+/// pending scheduled update in place). Each role object distinguishes
+/// *absent* (no change, outer `None`) from *null* (clear all of that role's
+/// state immediately, discarding any pending scheduled update: `Some(None)`).
+///
+/// For `metadata` and `color`, a future `timestamp` is a **scheduled
+/// update**: keep the current state plus at most one pending update, apply
+/// the pending one when its (time-filter-translated) timestamp is reached,
+/// and let a past-or-present-timestamped message apply immediately and
+/// discard any pending update.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerState {
     /// Metadata state (track info, progress, etc.)
@@ -688,7 +790,8 @@ pub type Rgb = [u8; 3];
 /// server sends only the palette entries it has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorState {
-    /// Server clock time in microseconds for when these colors are valid
+    /// Server clock time in microseconds at which these colors take effect.
+    /// A future timestamp schedules the update (see [`ServerState`]).
     pub timestamp: i64,
     /// Background color suitable for dark mode. The server ensures a minimum
     /// WCAG contrast ratio of 4.5:1 with white text and with `on_dark`
@@ -723,7 +826,9 @@ pub struct ColorState {
 /// Metadata state from server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataState {
-    /// Server timestamp for progress calculation (microseconds)
+    /// Server clock time in microseconds at which this metadata takes effect,
+    /// and the point progress extrapolation runs from. A future timestamp
+    /// schedules the update (see [`ServerState`]).
     pub timestamp: i64,
     /// Track title
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -784,11 +889,9 @@ pub struct ControllerState {
     /// Whether audio is muted
     pub muted: bool,
     /// Repeat mode
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repeat: Option<RepeatMode>,
+    pub repeat: RepeatMode,
     /// Shuffle state
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shuffle: Option<bool>,
+    pub shuffle: bool,
     /// Maximum absolute position in milliseconds a 'seek' may target (e.g.,
     /// the end of the current track). Present whenever 'seek' is in
     /// `supported_commands`; absent when the seekable range is unknown.
@@ -963,24 +1066,13 @@ pub struct StreamPlayerConfig {
     pub codec_header: Option<String>,
 }
 
-/// Stream artwork configuration
+/// Stream artwork configuration: per-channel configuration, positional from
+/// channel 0 and never longer than 4. A channel the array does not cover, or
+/// whose `source` is `'none'`, is not streamed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamArtworkConfig {
-    /// Configuration for each active artwork channel, array index is the channel number
-    pub channels: Vec<StreamArtworkChannelConfig>,
-}
-
-/// Configuration for a single artwork channel in stream/start
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamArtworkChannelConfig {
-    /// Artwork source type
-    pub source: ArtworkSource,
-    /// Format of the encoded image
-    pub format: ImageFormat,
-    /// Width in pixels of the encoded image
-    pub width: u32,
-    /// Height in pixels of the encoded image
-    pub height: u32,
+    /// Configuration for each artwork channel, array index is the channel number
+    pub channels: Vec<ArtworkChannelConfig>,
 }
 
 /// Stream visualizer configuration.
@@ -1008,8 +1100,6 @@ impl StreamVisualizerConfig {
 /// Stream end message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEnd {
-    /// Timestamp that the server transmitted this message in microseconds
-    pub server_transmitted: i64,
     /// Roles for which streaming has ended (optional, all if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
@@ -1029,7 +1119,7 @@ pub struct StreamClear {
 // Source Stream Messages (client → server)
 // =============================================================================
 
-/// Announces the source's active input stream format (`client_stream/start`).
+/// Announces the source's active input stream format (`client-stream/start`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientStreamStart {
     /// The input stream format
@@ -1052,107 +1142,23 @@ pub struct SourceStreamConfig {
     pub codec_header: Option<String>,
 }
 
-/// Ends the source's current input stream (`client_stream/end`). No payload fields.
+/// Ends the source's current input stream (`client-stream/end`). No payload fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientStreamEnd {}
-
-/// Stream format request from client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamRequestFormat {
-    /// Requested player format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub player: Option<PlayerFormatRequest>,
-    /// Requested artwork format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artwork: Option<ArtworkFormatRequest>,
-    /// Requested visualizer format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub visualizer: Option<VisualizerFormatRequest>,
-}
-
-/// Requested visualizer stream format. Omitted fields keep their current value.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VisualizerFormatRequest {
-    /// New visualization data types.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub types: Option<Vec<VisualizerDataType>>,
-    /// New periodic visualization frames-per-second cap.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_max: Option<u32>,
-    /// New spectrum configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spectrum: Option<SpectrumConfig>,
-}
-
-impl VisualizerFormatRequest {
-    /// Validate that this request changes at least one field.
-    ///
-    /// This is a partial update: omitted fields retain their current value, so
-    /// a request may omit `spectrum` even when its new `types` includes it.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.types.is_none() && self.rate_max.is_none() && self.spectrum.is_none() {
-            return Err("visualizer format request must specify at least one field");
-        }
-        if let (Some(types), Some(spectrum)) = (self.types.as_ref(), self.spectrum.as_ref()) {
-            validate_spectrum(types, Some(spectrum))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Player format request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerFormatRequest {
-    /// Preferred codec
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codec: Option<String>,
-    /// Preferred channel count
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channels: Option<u8>,
-    /// Preferred sample rate
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<u32>,
-    /// Preferred bit depth
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bit_depth: Option<u8>,
-}
-
-/// Artwork format request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtworkFormatRequest {
-    /// Artwork channel to request
-    pub channel: u8,
-    /// Preferred image source
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<ArtworkSource>,
-    /// Preferred image format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<ImageFormat>,
-    /// Display width in pixels
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub media_width: Option<u32>,
-    /// Display height in pixels
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub media_height: Option<u32>,
-}
 
 // =============================================================================
 // Group Messages
 // =============================================================================
 
-/// Group update notification
+/// Group update notification. Every message carries the full group state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupUpdate {
     /// Current playback state of the group
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playback_state: Option<PlaybackState>,
+    pub playback_state: PlaybackState,
     /// Group identifier
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
+    pub group_id: String,
     /// Human-readable group name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_name: Option<String>,
+    pub group_name: String,
 }
 
 /// Group playback state
@@ -1299,161 +1305,4 @@ pub enum PairAbortReason {
     PairingCodeMismatch,
     /// Operator aborted the pairing through a local UI
     UserCancelled,
-}
-
-// =============================================================================
-// Management Messages
-// =============================================================================
-
-/// List the client's pairing records. No payload fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ManagementListRecords {}
-
-/// Add a pairing record directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagementAddRecord {
-    /// 43-char base64url 32-byte Sendspin PSK (no padding)
-    pub psk: String,
-    /// Present for stored-pubkey records, absent for shared-PSK records
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_id: Option<String>,
-}
-
-/// Remove a pairing record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagementRemoveRecord {
-    /// The record's psk_id
-    pub psk_id: String,
-}
-
-/// Read the client's pairing configuration. No payload fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ManagementGetPairingConfig {}
-
-/// Modify the client's pairing configuration (applied as a patch).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ManagementSetPairingConfig {
-    /// Pairing PSK method settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pairing_psk: Option<PairingPskConfigPatch>,
-    /// Static pairing code method settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub static_pairing_code: Option<StaticPairingCodeConfigPatch>,
-    /// Dynamic pairing code method settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dynamic_pairing_code: Option<DynamicPairingCodeConfigPatch>,
-    /// Record-mode setting (storage-exhaustion fallback record)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub record_mode: Option<RecordMode>,
-    /// Unpaired-access setting
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unpaired_access: Option<UnpairedAccessPatch>,
-}
-
-/// Patch for the Pairing PSK method config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PairingPskConfigPatch {
-    /// Enable or disable the method
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Replace the configured Pairing PSK (43-char base64url)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub psk: Option<String>,
-}
-
-/// Patch for the static pairing code method config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StaticPairingCodeConfigPatch {
-    /// Enable or disable the method
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Replace the configured static pairing code (8 decimal digits)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
-/// Patch for the dynamic pairing code method config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DynamicPairingCodeConfigPatch {
-    /// Enable or disable the method
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-}
-
-/// Patch for the unpaired-access toggle.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct UnpairedAccessPatch {
-    /// Enable or disable unpaired access
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-}
-
-/// Record-mode setting: the shared-PSK record used as the storage-exhaustion fallback.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecordMode {
-    /// psk_id of the fallback shared-PSK record
-    pub psk_id: String,
-}
-
-/// Open a pairing window in place of the operator gesture. No payload fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ManagementOpenPairingWindow {}
-
-/// Response to a `management/*` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagementResult {
-    /// Result code
-    pub result: ManagementResultCode,
-    /// Operation-specific response payload (present only when defined and `result` is `ok`)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-    /// Storage accounting, from clients that track bounded storage
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub storage: Option<StorageAccounting>,
-}
-
-/// Management result code.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagementResultCode {
-    /// Operation completed and any state change has been persisted
-    Ok,
-    /// The request was issued outside a valid management session
-    PermissionDenied,
-    /// The request conflicts with an existing entry on the client
-    AlreadyExists,
-    /// Malformed payload, out-of-range value, missing field, or referential violation
-    Invalid,
-    /// The request targets an identifier that does not exist on the client
-    NotFound,
-    /// The client cannot persist the change due to full storage
-    StorageExhausted,
-}
-
-/// Storage accounting reported in `management/result`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StorageAccounting {
-    /// Currently free space (always present)
-    pub free: u64,
-    /// Total pool size (on list-records / get-pairing-config results)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<u64>,
-    /// Cost of a new stored-pubkey record
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_individual: Option<u64>,
-    /// Cost of a new shared-PSK record
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_shared: Option<u64>,
-}
-
-/// A pairing record entry in `management/list-records` result data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecordEntry {
-    /// The record's psk_id
-    pub psk_id: String,
-    /// Present for stored-pubkey records, absent for shared-PSK records
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_id: Option<String>,
-    /// True once a server has authenticated a session with this record's PSK
-    pub used: bool,
 }

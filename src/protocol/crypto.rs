@@ -114,21 +114,142 @@ impl Identity {
 // Pre-shared keys
 // =============================================================================
 
-/// The trust category a PSK belongs to. The three categories share one
-/// `psk_id` namespace; the stored category of a matched PSK determines how the
-/// client proceeds after the handshake.
+/// Stable device credentials required by every spec-conforming client.
+///
+/// This bundles the client's long-lived Noise identity and Pairing PSK because
+/// the pairing token binds them together. The library never persists this
+/// value; applications should persist [`Self::to_bytes`] and restore it with
+/// [`Self::from_bytes`] before constructing a client.
+#[derive(Clone)]
+pub struct ClientCredentials {
+    identity: Identity,
+    pairing_psk: Psk,
+}
+
+impl std::fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentials")
+            .field("client_id", &self.client_id())
+            .field("pairing_psk_id", &self.pairing_psk.psk_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientCredentials {
+    const FORMAT_VERSION: u8 = 1;
+    /// Serialized length: version byte plus two 32-byte secrets.
+    pub const SERIALIZED_LEN: usize = 65;
+
+    /// Generate fresh per-device credentials from the OS CSPRNG.
+    pub fn generate() -> Result<Self> {
+        Ok(Self {
+            identity: Identity::generate()?,
+            pairing_psk: Psk::generate()?,
+        })
+    }
+
+    /// Construct credentials from already-persisted cryptographic parts.
+    pub fn from_parts(identity: Identity, pairing_psk: Psk) -> Self {
+        Self {
+            identity,
+            pairing_psk,
+        }
+    }
+
+    /// Restore credentials from the versioned binary persistence format.
+    ///
+    /// The current format is exactly 65 bytes:
+    /// `version (1 byte) || identity secret (32 bytes) || Pairing PSK (32 bytes)`.
+    /// The input must have the exact length and supported format version.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != Self::SERIALIZED_LEN {
+            return Err(Error::Crypto(format!(
+                "client credentials must be {} bytes, got {}",
+                Self::SERIALIZED_LEN,
+                bytes.len()
+            )));
+        }
+        if bytes[0] != Self::FORMAT_VERSION {
+            return Err(Error::Crypto(format!(
+                "unsupported client credentials version {}",
+                bytes[0]
+            )));
+        }
+        if bytes[1..33].iter().all(|&byte| byte == 0) || bytes[33..65].iter().all(|&byte| byte == 0)
+        {
+            return Err(Error::Crypto(
+                "client credentials contain an all-zero key or PSK".to_string(),
+            ));
+        }
+        let identity =
+            Identity::from_secret_bytes(bytes[1..33].try_into().expect("length checked"));
+        let pairing_psk = Psk::new(bytes[33..65].try_into().expect("length checked"));
+        Ok(Self::from_parts(identity, pairing_psk))
+    }
+
+    /// Serialize credentials for application-owned secure storage.
+    ///
+    /// The returned bytes contain private key material and should be protected
+    /// by the application's chosen credential store.
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_LEN] {
+        let mut bytes = [0u8; Self::SERIALIZED_LEN];
+        bytes[0] = Self::FORMAT_VERSION;
+        bytes[1..33].copy_from_slice(self.identity.secret_bytes());
+        bytes[33..65].copy_from_slice(self.pairing_psk.bytes());
+        bytes
+    }
+
+    /// The client's stable public identity string.
+    pub fn client_id(&self) -> String {
+        self.identity.id()
+    }
+
+    /// Access the underlying Noise identity.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// Access the reusable Pairing PSK.
+    pub fn pairing_psk(&self) -> &Psk {
+        &self.pairing_psk
+    }
+
+    /// Produce the required version-0 pairing token for operator export.
+    ///
+    /// The token contains the Pairing PSK, so treat it as sensitive while it is
+    /// displayed or transferred to the operator/server.
+    pub fn pairing_token(&self) -> String {
+        crate::protocol::pairing::pairing_psk_token(&self.identity, &self.pairing_psk)
+    }
+}
+
+/// The category a PSK belongs to. The client stores each PSK tagged with its
+/// category; Noise message 1 declares the category the server is using the
+/// referenced PSK as, and a match binds both sides to the same category.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PskCategory {
     /// The published Sentinel PSK (no authentication; unpaired connections).
     Sentinel,
-    /// The client's Pairing PSK (admits only the `['pairing']` activity set).
+    /// The client's pairing PSK (admits only the `['pairing']` activity set).
     Pairing,
-    /// A long-term Sendspin PSK from a pairing record. `server_id` is present
-    /// for stored-pubkey records and absent for shared-PSK records.
+    /// A long-term PSK from a pairing record, bound to the server identity
+    /// it was established with.
     LongTerm {
-        /// The bound server identity, if this is a stored-pubkey record.
-        server_id: Option<String>,
+        /// The bound server identity.
+        server_id: String,
     },
+}
+
+impl PskCategory {
+    /// The wire code (`'lt'` / `'pr'` / `'sn'`) this category matches.
+    pub fn wire(&self) -> crate::protocol::messages::PskCategory {
+        use crate::protocol::messages::PskCategory as Wire;
+        match self {
+            PskCategory::LongTerm { .. } => Wire::LongTerm,
+            PskCategory::Pairing => Wire::Pairing,
+            PskCategory::Sentinel => Wire::Sentinel,
+        }
+    }
 }
 
 /// A 32-byte pre-shared key together with its derived identifier.
@@ -202,12 +323,20 @@ pub struct PskCandidate {
     pub category: PskCategory,
 }
 
-/// Select the candidate matching a wire `psk_id`, if any.
+/// Select the candidate matching a wire `psk_id` under the declared
+/// `psk_category`, if any. A `psk_id` held only under a different category is
+/// a lookup miss.
 ///
-/// Returns `None` on a lookup miss, which is a handshake failure per the spec
-/// (close the WebSocket without an application-level error).
-pub fn select_psk<'a>(candidates: &'a [PskCandidate], psk_id: &str) -> Option<&'a PskCandidate> {
-    candidates.iter().find(|c| c.psk.psk_id() == psk_id)
+/// A miss in the **initial** handshake falls back to the Sentinel PSK (spec:
+/// Sentinel Fallback); a miss during a re-handshake fails the handshake.
+pub fn select_psk<'a>(
+    candidates: &'a [PskCandidate],
+    psk_id: &str,
+    category: crate::protocol::messages::PskCategory,
+) -> Option<&'a PskCandidate> {
+    candidates
+        .iter()
+        .find(|c| c.category.wire() == category && c.psk.psk_id() == psk_id)
 }
 
 // =============================================================================
@@ -362,20 +491,71 @@ mod tests {
     }
 
     #[test]
-    fn select_psk_finds_matching_candidate() {
+    fn client_credentials_round_trip_and_pairing_token_bind_them() {
+        let credentials = ClientCredentials::from_parts(
+            Identity::from_secret_bytes([1u8; 32]),
+            Psk::new([2u8; 32]),
+        );
+        let bytes = credentials.to_bytes();
+        assert_eq!(bytes.len(), ClientCredentials::SERIALIZED_LEN);
+        assert_eq!(bytes[0], 1);
+        let restored = ClientCredentials::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.client_id(), credentials.client_id());
+        assert_eq!(
+            restored.pairing_psk().psk_id(),
+            credentials.pairing_psk().psk_id()
+        );
+        assert_eq!(restored.pairing_token(), credentials.pairing_token());
+    }
+
+    #[test]
+    fn client_credentials_reject_wrong_length_and_version() {
+        assert!(ClientCredentials::from_bytes(&[1; 64]).is_err());
+        let mut bytes = [0u8; ClientCredentials::SERIALIZED_LEN];
+        bytes[0] = 2;
+        assert!(ClientCredentials::from_bytes(&bytes).is_err());
+        bytes[0] = 1;
+        bytes[1] = 1;
+        assert!(ClientCredentials::from_bytes(&bytes).is_err());
+        bytes[1] = 0;
+        bytes[33] = 1;
+        assert!(ClientCredentials::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn generated_client_credentials_are_nonempty() {
+        let credentials = ClientCredentials::generate().unwrap();
+        assert_ne!(credentials.identity().secret_bytes(), &[0u8; 32]);
+        assert_ne!(credentials.pairing_psk().bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn select_psk_finds_matching_candidate_scoped_by_category() {
+        use crate::protocol::messages::PskCategory as Wire;
+        let long_term = Psk::new([7u8; 32]);
         let candidates = vec![
             PskCandidate {
                 psk: Psk::sentinel(),
                 category: PskCategory::Sentinel,
             },
             PskCandidate {
-                psk: Psk::new([7u8; 32]),
-                category: PskCategory::LongTerm { server_id: None },
+                psk: long_term.clone(),
+                category: PskCategory::LongTerm {
+                    server_id: "srv".to_string(),
+                },
             },
         ];
-        let hit = select_psk(&candidates, SENTINEL_PSK_ID).unwrap();
+        let hit = select_psk(&candidates, SENTINEL_PSK_ID, Wire::Sentinel).unwrap();
         assert_eq!(hit.category, PskCategory::Sentinel);
-        assert!(select_psk(&candidates, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_none());
+        // A psk_id held only under a different category is a lookup miss.
+        assert!(select_psk(&candidates, &long_term.psk_id(), Wire::Pairing).is_none());
+        assert!(select_psk(&candidates, &long_term.psk_id(), Wire::LongTerm).is_some());
+        assert!(select_psk(
+            &candidates,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            Wire::LongTerm
+        )
+        .is_none());
     }
 
     /// Full KKpsk2 round trip between a simulated server (initiator) and the

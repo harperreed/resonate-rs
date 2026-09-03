@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sendspin::protocol::messages::{GoodbyeReason, Message, RepeatMode};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Sendspin controller-only client
@@ -22,7 +22,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Connecting to {}...", args.server);
+    // Persist credentials.to_bytes() in application-owned secure storage and
+    // restore them with ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
     let builder = ProtocolClientBuilder::builder()
+        .credentials(credentials)
         .name("Controller Example".to_string())
         .controller()
         .build();

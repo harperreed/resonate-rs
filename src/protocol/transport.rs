@@ -7,7 +7,7 @@
 //! exchange, every Sendspin application message travels as a WebSocket binary
 //! frame whose payload is a Noise transport ciphertext. The first byte of the
 //! AEAD plaintext is the binary message ID (`0` = JSON body); messages larger
-//! than one Noise message are split across fragment frames (IDs 2 and 3).
+//! than one Noise message are split across fragment frames (ID 1).
 
 use crate::error::Error;
 use crate::protocol::crypto::{
@@ -19,10 +19,20 @@ use crate::Result;
 pub mod frame_type {
     /// JSON message body (UTF-8).
     pub const JSON: u8 = 0;
-    /// Fragment-more frame (fragmented message, not the last fragment).
-    pub const FRAGMENT_MORE: u8 = 2;
-    /// Fragment-end frame (last fragment of a fragmented message).
-    pub const FRAGMENT_END: u8 = 3;
+    /// Fragment frame: `[1][flags][orig_type?][data]`.
+    pub const FRAGMENT: u8 = 1;
+    /// Pairing digit audio clip (dynamic pairing code `digits` emission).
+    pub const DIGIT_AUDIO_CLIP: u8 = 2;
+}
+
+/// Fragment `flags` bits (byte 1 of a fragment frame).
+mod fragment_flags {
+    /// Set on the last fragment of a message.
+    pub const LAST: u8 = 0b0000_0001;
+    /// Set on the first fragment of a message (which carries `orig_type`).
+    pub const FIRST: u8 = 0b0000_0010;
+    /// Bits 2-7 are reserved and must be zero.
+    pub const RESERVED: u8 = !(LAST | FIRST);
 }
 
 /// Maximum AEAD plaintext per Noise transport message.
@@ -33,7 +43,7 @@ const MAX_SINGLE_PAYLOAD: usize = MAX_PLAINTEXT - 1; // 65518
 
 /// Maximum size of a reassembled fragmented message. The spec places no
 /// limit on the logical message, so without a cap a peer could stream
-/// fragment-more frames until the process runs out of memory. 16 MiB
+/// non-final fragments until the process runs out of memory. 16 MiB
 /// comfortably covers the largest defined payloads (artwork images) while
 /// bounding a malicious or broken peer.
 const MAX_REASSEMBLED_LEN: usize = 16 * 1024 * 1024;
@@ -172,9 +182,9 @@ impl EncryptedChannel {
     /// Encrypt one application message into one or more WebSocket binary
     /// frame payloads (Noise ciphertexts), fragmenting when required.
     ///
-    /// `msg_type` must not be a fragment type (2 or 3).
+    /// `msg_type` must not be the fragment type (1).
     pub fn encrypt_message(&mut self, msg_type: u8, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if msg_type == frame_type::FRAGMENT_MORE || msg_type == frame_type::FRAGMENT_END {
+        if msg_type == frame_type::FRAGMENT {
             return Err(Error::Protocol(format!(
                 "message type {msg_type} is reserved for fragmentation"
             )));
@@ -186,27 +196,32 @@ impl EncryptedChannel {
             return Ok(vec![self.encrypt_plaintext(&plaintext)?]);
         }
 
-        // Fragmented: opening fragment-more frame carries orig_type.
+        // Fragmented: the first fragment carries orig_type.
+        // First fragment: [1][flags: FIRST][orig_type][data]
         let mut frames = Vec::new();
-        let first_chunk_len = MAX_PLAINTEXT - 2; // [2][orig_type][data]
+        let first_chunk_len = MAX_PLAINTEXT - 3;
         let (first, mut rest) = payload.split_at(first_chunk_len);
         let mut plaintext = Vec::with_capacity(MAX_PLAINTEXT);
-        plaintext.push(frame_type::FRAGMENT_MORE);
+        plaintext.push(frame_type::FRAGMENT);
+        plaintext.push(fragment_flags::FIRST);
         plaintext.push(msg_type);
         plaintext.extend_from_slice(first);
         frames.push(self.encrypt_plaintext(&plaintext)?);
 
-        // Continuation frames: [2][data]; final frame: [3][data].
-        while rest.len() > MAX_SINGLE_PAYLOAD {
-            let (chunk, tail) = rest.split_at(MAX_SINGLE_PAYLOAD);
-            let mut plaintext = Vec::with_capacity(1 + chunk.len());
-            plaintext.push(frame_type::FRAGMENT_MORE);
+        // Subsequent fragments: [1][flags][data], LAST set on the final one.
+        let max_chunk = MAX_PLAINTEXT - 2;
+        while rest.len() > max_chunk {
+            let (chunk, tail) = rest.split_at(max_chunk);
+            let mut plaintext = Vec::with_capacity(2 + chunk.len());
+            plaintext.push(frame_type::FRAGMENT);
+            plaintext.push(0);
             plaintext.extend_from_slice(chunk);
             frames.push(self.encrypt_plaintext(&plaintext)?);
             rest = tail;
         }
-        let mut plaintext = Vec::with_capacity(1 + rest.len());
-        plaintext.push(frame_type::FRAGMENT_END);
+        let mut plaintext = Vec::with_capacity(2 + rest.len());
+        plaintext.push(frame_type::FRAGMENT);
+        plaintext.push(fragment_flags::LAST);
         plaintext.extend_from_slice(rest);
         frames.push(self.encrypt_plaintext(&plaintext)?);
         Ok(frames)
@@ -229,52 +244,68 @@ impl EncryptedChannel {
             .split_first()
             .ok_or_else(|| Error::Protocol("empty noise plaintext".into()))?;
 
-        match (&mut self.reassembly, msg_type) {
-            // No message in flight: a fragment-more frame begins one.
-            (None, frame_type::FRAGMENT_MORE) => {
-                let (&orig_type, first) = data.split_first().ok_or_else(|| {
-                    Error::Protocol("opening fragment frame missing orig_type".into())
-                })?;
-                if orig_type == frame_type::FRAGMENT_MORE || orig_type == frame_type::FRAGMENT_END {
-                    return Err(Error::Protocol(format!(
-                        "invalid fragmented orig_type {orig_type}"
-                    )));
-                }
-                self.reassembly = Some((orig_type, first.to_vec()));
-                Ok(None)
+        if msg_type != frame_type::FRAGMENT {
+            return match &self.reassembly {
+                // Non-fragment frame while a fragmented message is in flight
+                // is a protocol error.
+                Some(_) => Err(Error::Protocol(format!(
+                    "non-fragment frame (type {msg_type}) while a fragmented message is in flight"
+                ))),
+                None => Ok(Some((msg_type, data.to_vec()))),
+            };
+        }
+
+        // Fragment frame: [1][flags][orig_type?][data].
+        let (&flags, data) = data
+            .split_first()
+            .ok_or_else(|| Error::Protocol("fragment frame missing flags byte".into()))?;
+        if flags & fragment_flags::RESERVED != 0 {
+            return Err(Error::Protocol(format!(
+                "nonzero reserved fragment flag bits: {flags:#010b}"
+            )));
+        }
+        let first = flags & fragment_flags::FIRST != 0;
+        let last = flags & fragment_flags::LAST != 0;
+
+        let data = if first {
+            if self.reassembly.is_some() {
+                return Err(Error::Protocol(
+                    "first fragment received while a fragmented message is in flight".into(),
+                ));
             }
-            // No message in flight: a fragment-end frame is a protocol error.
-            (None, frame_type::FRAGMENT_END) => Err(Error::Protocol(
-                "fragment-end frame with no fragmented message in flight".into(),
-            )),
-            // No message in flight: ordinary message.
-            (None, _) => Ok(Some((msg_type, data.to_vec()))),
-            // Message in flight: continuation.
-            (Some((_, buffer)), frame_type::FRAGMENT_MORE) => {
-                if buffer.len() + data.len() > MAX_REASSEMBLED_LEN {
-                    self.reassembly = None;
-                    return Err(Error::Protocol(format!(
-                        "fragmented message exceeds {MAX_REASSEMBLED_LEN} bytes"
-                    )));
-                }
-                buffer.extend_from_slice(data);
-                Ok(None)
+            let (&orig_type, rest) = data
+                .split_first()
+                .ok_or_else(|| Error::Protocol("first fragment missing orig_type".into()))?;
+            if orig_type == frame_type::FRAGMENT {
+                return Err(Error::Protocol(format!(
+                    "invalid fragmented orig_type {orig_type}"
+                )));
             }
-            // Message in flight: final fragment dispatches the message.
-            (Some(_), frame_type::FRAGMENT_END) => {
-                let (orig_type, mut buffer) = self.reassembly.take().expect("checked in-flight");
-                if buffer.len() + data.len() > MAX_REASSEMBLED_LEN {
-                    return Err(Error::Protocol(format!(
-                        "fragmented message exceeds {MAX_REASSEMBLED_LEN} bytes"
-                    )));
-                }
-                buffer.extend_from_slice(data);
-                Ok(Some((orig_type, buffer)))
+            self.reassembly = Some((orig_type, Vec::new()));
+            rest
+        } else {
+            if self.reassembly.is_none() {
+                return Err(Error::Protocol(
+                    "non-first fragment with no fragmented message in flight".into(),
+                ));
             }
-            // Message in flight: any non-fragment frame is a protocol error.
-            (Some(_), other) => Err(Error::Protocol(format!(
-                "non-fragment frame (type {other}) while a fragmented message is in flight"
-            ))),
+            data
+        };
+
+        let (_, buffer) = self.reassembly.as_mut().expect("in flight");
+        if buffer.len() + data.len() > MAX_REASSEMBLED_LEN {
+            self.reassembly = None;
+            return Err(Error::Protocol(format!(
+                "fragmented message exceeds {MAX_REASSEMBLED_LEN} bytes"
+            )));
+        }
+        buffer.extend_from_slice(data);
+
+        if last {
+            let (orig_type, buffer) = self.reassembly.take().expect("in flight");
+            Ok(Some((orig_type, buffer)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -392,18 +423,17 @@ mod tests {
         for (i, frame) in frames.iter().enumerate() {
             let len = server.read_message(frame, &mut plaintext).unwrap();
             assert!(len <= NOISE_MAX_MESSAGE - AEAD_TAG_LEN);
-            let ftype = plaintext[0];
+            assert_eq!(plaintext[0], frame_type::FRAGMENT);
+            let flags = plaintext[1];
+            assert_eq!(flags & fragment_flags::RESERVED, 0);
             let last = i == frames.len() - 1;
-            if last {
-                assert_eq!(ftype, frame_type::FRAGMENT_END);
-                reassembled.extend_from_slice(&plaintext[1..len]);
-            } else if i == 0 {
-                assert_eq!(ftype, frame_type::FRAGMENT_MORE);
-                orig_type = Some(plaintext[1]);
-                reassembled.extend_from_slice(&plaintext[2..len]);
+            assert_eq!(flags & fragment_flags::LAST != 0, last);
+            assert_eq!(flags & fragment_flags::FIRST != 0, i == 0);
+            if i == 0 {
+                orig_type = Some(plaintext[2]);
+                reassembled.extend_from_slice(&plaintext[3..len]);
             } else {
-                assert_eq!(ftype, frame_type::FRAGMENT_MORE);
-                reassembled.extend_from_slice(&plaintext[1..len]);
+                reassembled.extend_from_slice(&plaintext[2..len]);
             }
         }
         assert_eq!(orig_type, Some(frame_type::JSON));
@@ -415,9 +445,17 @@ mod tests {
         let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
 
         // Server sends a fragmented type-8 (artwork) message in 3 frames.
-        let f1 = server_send(&mut server, frame_type::FRAGMENT_MORE, &[8, 1, 2, 3]);
-        let f2 = server_send(&mut server, frame_type::FRAGMENT_MORE, &[4, 5]);
-        let f3 = server_send(&mut server, frame_type::FRAGMENT_END, &[6]);
+        let f1 = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST, 8, 1, 2, 3],
+        );
+        let f2 = server_send(&mut server, frame_type::FRAGMENT, &[0, 4, 5]);
+        let f3 = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::LAST, 6],
+        );
 
         assert!(channel.decrypt_frame(&f1).unwrap().is_none());
         assert!(channel.decrypt_frame(&f2).unwrap().is_none());
@@ -427,44 +465,101 @@ mod tests {
     }
 
     #[test]
-    fn fragment_end_without_in_flight_is_protocol_error() {
+    fn single_fragment_with_first_and_last_dispatches() {
         let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
-        let frame = server_send(&mut server, frame_type::FRAGMENT_END, b"x");
+        let frame = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST | fragment_flags::LAST, 8, 1, 2],
+        );
+        let (msg_type, payload) = channel.decrypt_frame(&frame).unwrap().unwrap();
+        assert_eq!(msg_type, 8);
+        assert_eq!(payload, vec![1, 2]);
+    }
+
+    #[test]
+    fn non_first_fragment_without_in_flight_is_protocol_error() {
+        let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
+        let frame = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::LAST, 1],
+        );
         assert!(channel.decrypt_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn first_fragment_during_in_flight_is_protocol_error() {
+        let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
+        let f1 = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST, 8, 1],
+        );
+        assert!(channel.decrypt_frame(&f1).unwrap().is_none());
+        let f2 = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST, 8, 1],
+        );
+        assert!(channel.decrypt_frame(&f2).is_err());
     }
 
     #[test]
     fn non_fragment_during_in_flight_is_protocol_error() {
         let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
-        let f1 = server_send(&mut server, frame_type::FRAGMENT_MORE, &[8, 1]);
+        let f1 = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST, 8, 1],
+        );
         assert!(channel.decrypt_frame(&f1).unwrap().is_none());
         let bad = server_send(&mut server, frame_type::JSON, b"{}");
         assert!(channel.decrypt_frame(&bad).is_err());
     }
 
     #[test]
-    fn fragmented_orig_type_2_or_3_is_protocol_error() {
+    fn reserved_flag_bits_are_protocol_error() {
         let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
-        let frame = server_send(&mut server, frame_type::FRAGMENT_MORE, &[3, 1, 2]);
+        let frame = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST | 0b0000_0100, 8, 1],
+        );
+        assert!(channel.decrypt_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn fragmented_orig_type_1_is_protocol_error() {
+        let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
+        let frame = server_send(
+            &mut server,
+            frame_type::FRAGMENT,
+            &[fragment_flags::FIRST, frame_type::FRAGMENT, 1, 2],
+        );
         assert!(channel.decrypt_frame(&frame).is_err());
     }
 
     #[test]
     fn oversized_reassembly_is_rejected() {
         let (mut server, mut channel) = establish(CipherSuite::ChaChaPoly);
-        let chunk = vec![0u8; MAX_SINGLE_PAYLOAD - 1];
+        let chunk = vec![0u8; MAX_SINGLE_PAYLOAD - 2];
         let f1 = server_send(
             &mut server,
-            frame_type::FRAGMENT_MORE,
-            &[&[8u8][..], &chunk].concat(),
+            frame_type::FRAGMENT,
+            &[&[fragment_flags::FIRST, 8u8][..], &chunk].concat(),
         );
         assert!(channel.decrypt_frame(&f1).unwrap().is_none());
         let mut rejected = false;
         for _ in 0..(MAX_REASSEMBLED_LEN / chunk.len() + 2) {
-            let frame = server_send(&mut server, frame_type::FRAGMENT_MORE, &chunk);
+            let frame = server_send(
+                &mut server,
+                frame_type::FRAGMENT,
+                &[&[0u8][..], &chunk].concat(),
+            );
             match channel.decrypt_frame(&frame) {
                 Ok(None) => continue,
-                Ok(Some(_)) => panic!("no fragment-end was sent"),
+                Ok(Some(_)) => panic!("no last fragment was sent"),
                 Err(_) => {
                     rejected = true;
                     break;
@@ -475,10 +570,9 @@ mod tests {
     }
 
     #[test]
-    fn sender_rejects_fragment_types_as_orig_type() {
+    fn sender_rejects_fragment_type_as_orig_type() {
         let (_server, mut channel) = establish(CipherSuite::ChaChaPoly);
-        assert!(channel.encrypt_message(2, b"x").is_err());
-        assert!(channel.encrypt_message(3, b"x").is_err());
+        assert!(channel.encrypt_message(frame_type::FRAGMENT, b"x").is_err());
     }
 
     #[test]

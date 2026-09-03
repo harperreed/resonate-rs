@@ -1,6 +1,6 @@
 mod common;
 
-use common::MockServer;
+use common::{test_credentials, MockServer};
 use sendspin::protocol::manager::{
     should_switch, ArbitrationState, ConnectionManager, ManagerConfig,
 };
@@ -17,7 +17,7 @@ fn incoming(activities: Vec<Activity>, id: &str) -> SessionInfo {
     SessionInfo {
         server_id: id.into(),
         server_name: id.into(),
-        trust_level: sendspin::protocol::messages::TrustLevel::None,
+        paired: false,
         suite: sendspin::CipherSuite::ChaChaPoly,
         initial_activities: activities,
         initial_active_roles: vec![],
@@ -34,6 +34,7 @@ fn current(activities: Vec<Activity>, id: &str) -> ArbitrationState {
 
 async fn manager(config: Option<ManagerConfig>) -> (SocketAddr, ConnectionManager) {
     let listener = ProtocolClientBuilder::builder()
+        .credentials(test_credentials())
         .name("Managed Client".into())
         .build()
         .listen("127.0.0.1:0")
@@ -92,9 +93,9 @@ async fn channels_close(connection: &mut sendspin::ManagedConnection) {
 
 #[test]
 fn activity_priority_controls_switching() {
-    assert!(should_switch(
+    assert!(!should_switch(
         &current(vec![Activity::Playback], "a"),
-        &incoming(vec![Activity::Management], "b"),
+        &incoming(vec![Activity::Pairing], "b"),
         None
     ));
 }

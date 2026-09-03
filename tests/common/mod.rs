@@ -20,6 +20,13 @@ use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 type BoxError = Box<dyn Error + Send + Sync>;
 type Ws<S> = WebSocketStream<S>;
 
+pub fn test_credentials() -> sendspin::ClientCredentials {
+    sendspin::ClientCredentials::from_parts(
+        sendspin::Identity::from_secret_bytes([1u8; 32]),
+        sendspin::Psk::new([2u8; 32]),
+    )
+}
+
 enum Command {
     Json(Message),
     Audio { timestamp: i64, data: Vec<u8> },
@@ -128,7 +135,11 @@ impl MockServer {
         )?;
         let mut buf = vec![0u8; 65535];
         let msg1_len = handshake.write_message(
-            format!(r#"{{"psk_id":"{}"}}"#, Psk::sentinel().psk_id()).as_bytes(),
+            format!(
+                r#"{{"psk_id":"{}","psk_category":"sn"}}"#,
+                Psk::sentinel().psk_id()
+            )
+            .as_bytes(),
             &mut buf,
         )?;
         let msg1 = Message::NoiseHandshake(NoiseHandshake {
@@ -148,6 +159,7 @@ impl MockServer {
 
         let server_hello = Message::ServerHello(ServerHello {
             name: name.to_string(),
+            languages: None,
         });
         let json = serde_json::to_vec(&server_hello)?;
         let mut plain = Vec::with_capacity(json.len() + 1);
@@ -213,9 +225,10 @@ impl MockServer {
                             }
                         }
                         Some(Command::Audio { timestamp, data }) => {
-                            let mut plain = Vec::with_capacity(9 + data.len());
+                            let mut plain = Vec::with_capacity(13 + data.len());
                             plain.push(4);
                             plain.extend_from_slice(&timestamp.to_be_bytes());
+                            plain.extend_from_slice(&0u32.to_be_bytes());
                             plain.extend_from_slice(&data);
                             let mut encrypted = vec![0u8; plain.len() + 32];
                             match transport.write_message(&plain, &mut encrypted) {

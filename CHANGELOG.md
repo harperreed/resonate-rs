@@ -9,12 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `ClientCredentials`, including OS-CSPRNG generation, versioned byte
+  persistence, restoration, and Pairing PSK token access.
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.
 
 ### Changed
 
+- **BREAKING:** Require `.credentials(ClientCredentials)` when building a client;
+  applications now own persistence of the stable identity and mandatory Pairing PSK.
+  Replace old `.identity(...)`/`.pairing_psk(...)` calls with
+  `ClientCredentials::from_parts(...)` or restore via `from_bytes(...)`.
+- Always advertise and offer the Pairing PSK method for conforming clients.
+- Replace pairing records for the same server and keep live handshake candidates
+  synchronized after re-pairing; cross-server PSK-ID collisions remain errors.
+- Reject unsupported player formats, bound artwork transfers with configurable
+  `max_encoded_artwork_transfer_bytes`, serialize availability transitions, and
+  reject concurrent in-band re-handshakes.
 - Expand visualizer stream configuration and format-request APIs.
 
 ## [0.3.6](https://github.com/Sendspin/sendspin-rs/compare/v0.3.5...v0.3.6) - 2026-07-15

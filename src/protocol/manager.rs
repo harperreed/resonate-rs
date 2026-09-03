@@ -3,7 +3,7 @@
 
 use crate::error::Error;
 use crate::protocol::client::{
-    ArtworkChunk, AudioChunk, Connection, ConnectionGuard, Controller, SessionInfo, Source,
+    ArtworkMessage, AudioChunk, Connection, ConnectionGuard, Controller, SessionInfo, Source,
     VisualizerChunk, WsSender,
 };
 use crate::protocol::listener::ProtocolListener;
@@ -50,11 +50,11 @@ pub fn should_switch(
     last_played: Option<&str>,
 ) -> bool {
     // Connections are ranked by their highest-ranked declared activity:
-    // management > playback > pairing > empty. Higher or equal is accepted.
+    // playback > pairing > empty. Higher or equal is accepted.
     let candidate_rank = activity_rank(&candidate.initial_activities);
     let current_rank = activity_rank(&current.activities);
     // Exception: an in-progress pairing attempt is not displaced by an
-    // incoming 'playback' or 'pairing' connection (management still wins).
+    // incoming 'playback' or 'pairing' connection.
     if current.pairing_attempt_in_progress && candidate_rank <= activity_rank(&[Activity::Playback])
     {
         return false;
@@ -134,8 +134,8 @@ pub struct ManagedConnection {
     pub messages: Receiver<Message>,
     /// Audio chunks from the server (bounded with drop-on-full).
     pub audio: Receiver<AudioChunk>,
-    /// Artwork chunks from the server (bounded with drop-on-full).
-    pub artwork: Receiver<ArtworkChunk>,
+    /// Artwork events from the server (bounded with drop-on-full).
+    pub artwork: Receiver<ArtworkMessage>,
     /// Visualizer chunks from the server (bounded with drop-on-full).
     pub visualizer: Receiver<VisualizerChunk>,
     /// Clock synchronization state. Fresh per connection: audio components
@@ -204,9 +204,11 @@ struct Incumbent {
 /// shutdown.
 ///
 /// ```no_run
-/// # use sendspin::{ConnectionManager, ProtocolClientBuilder};
+/// # use sendspin::{ClientCredentials, ConnectionManager, ProtocolClientBuilder};
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let credentials = ClientCredentials::generate()?;
 /// let listener = ProtocolClientBuilder::builder()
+///     .credentials(credentials)
 ///     .name("Kitchen Speaker".to_string())
 ///     .build()
 ///     .listen("0.0.0.0:8927")
@@ -580,13 +582,13 @@ fn arbitrate(
 mod tests {
     use super::*;
     use crate::protocol::crypto::CipherSuite;
-    use crate::protocol::messages::{Activity, TrustLevel};
+    use crate::protocol::messages::Activity;
 
     fn session(server_id: &str, activities: Vec<Activity>) -> SessionInfo {
         SessionInfo {
             server_id: server_id.to_string(),
             server_name: format!("{server_id} name"),
-            trust_level: TrustLevel::None,
+            paired: false,
             suite: CipherSuite::ChaChaPoly,
             initial_activities: activities,
             initial_active_roles: vec![],
@@ -608,8 +610,9 @@ mod tests {
         let candidate = session("b", vec![Activity::Playback]);
         assert!(should_switch(&current, &candidate, None));
 
-        // management displaces playback
-        let candidate = session("b", vec![Activity::Management]);
+        // playback displaces pairing
+        let current = state("a", vec![Activity::Pairing]);
+        let candidate = session("b", vec![Activity::Playback]);
         assert!(should_switch(&current, &candidate, None));
 
         // playback displaces empty
@@ -626,7 +629,7 @@ mod tests {
         // Not even when the candidate is the last-playback server.
         assert!(!should_switch(&current, &candidate, Some("b")));
 
-        let current = state("a", vec![Activity::Management]);
+        let current = state("a", vec![Activity::Playback]);
         let candidate = session("b", vec![Activity::Pairing]);
         assert!(!should_switch(&current, &candidate, None));
     }
@@ -661,10 +664,6 @@ mod tests {
         assert!(!should_switch(&current, &playback, None));
         let pairing = session("b", vec![Activity::Pairing]);
         assert!(!should_switch(&current, &pairing, None));
-
-        // Management still wins.
-        let management = session("b", vec![Activity::Management]);
-        assert!(should_switch(&current, &management, None));
 
         // Without an in-progress attempt, normal ranking applies.
         current.pairing_attempt_in_progress = false;

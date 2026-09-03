@@ -24,7 +24,9 @@ pub use protocol::client::{
     Connection, ConnectionGuard, Controller, ProtocolClient, SessionInfo, Source, WsSender,
 };
 pub use protocol::client_builder::ProtocolClientBuilder;
-pub use protocol::crypto::{CipherSuite, Identity, Psk, PskCandidate, PskCategory};
+pub use protocol::crypto::{
+    CipherSuite, ClientCredentials, Identity, Psk, PskCandidate, PskCategory,
+};
 pub use protocol::listener::ProtocolListener;
 pub use protocol::manager::{ConnectionManager, ManagedConnection, ManagerConfig};
 pub use protocol::messages::ServerHello;

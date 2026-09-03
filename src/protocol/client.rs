@@ -7,17 +7,16 @@ use crate::protocol::crypto::{
     b64url_decode, b64url_decode_32, b64url_encode, select_psk, CipherSuite, Identity, Psk,
     PskCandidate, PskCategory,
 };
-use crate::protocol::management::ManagementState;
 use crate::protocol::manager::ArbitrationState;
 use crate::protocol::messages::{
     Activity, ClientGoodbye, ClientInit, ClientState, ClientTime, GoodbyeReason, Message,
-    NoiseHandshake, NoiseMessage1Payload, PairAbort, PairAbortReason, TrustLevel,
+    NoiseHandshake, NoiseMessage1Payload, PairAbort, PairAbortReason,
 };
 use crate::protocol::pairing::PairingStore;
 use crate::protocol::roles::SharedSessionState;
 use crate::protocol::session::{
-    enqueue_json, evaluate_activate, pairing_method_ok, trust_level_for, ActivateVerdict,
-    HelloTemplate, SessionFlow, SessionIo, SessionState,
+    enqueue_json, evaluate_activate, pairing_method_ok, ActivateVerdict, HelloTemplate,
+    SessionFlow, SessionIo, SessionState,
 };
 use crate::protocol::transport::{frame_type, ClientHandshake, EncryptedChannel};
 use crate::protocol::writer::{send_encrypted, writer_task, OutboundPayload, WriteCommand};
@@ -38,7 +37,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 pub use crate::protocol::binary::{
-    binary_types, ArtworkChunk, AudioChunk, BinaryFrame, VisualizerChunk,
+    binary_types, ArtworkImage, ArtworkMessage, AudioChunk, BinaryFrame, VisualizerChunk,
 };
 pub use crate::protocol::roles::{Controller, Source, WsSender};
 
@@ -76,16 +75,14 @@ pub(crate) struct SessionConfig {
     pub psk_candidates: Vec<PskCandidate>,
     /// Persistence for pairing records (new records land here).
     pub store: Arc<dyn PairingStore>,
-    /// The client's Pairing PSK, when configured.
-    pub pairing_psk: Option<Psk>,
     /// Whether this client currently admits unpaired access.
     pub unpaired_access: bool,
-    /// `record_mode.psk_id`: the pre-provisioned shared-PSK fallback record.
-    pub record_mode: String,
-    /// Template for `client/hello` (trust level is filled per connection).
+    /// Template for `client/hello`.
     pub hello: HelloTemplate,
     /// The initial `client/state` sent after `server/activate`.
     pub initial_state: ClientState,
+    /// Maximum encoded JPEG/PNG bytes accepted in one artwork transfer.
+    pub max_encoded_artwork_transfer_bytes: usize,
     /// Monotonic clock used for time sync.
     pub clock: Arc<dyn Clock>,
 }
@@ -103,8 +100,10 @@ pub struct SessionInfo {
     pub server_id: String,
     /// The server's friendly name from `server/hello`
     pub server_name: String,
-    /// Trust level asserted in `client/hello`
-    pub trust_level: TrustLevel,
+    /// Whether the session is paired: keyed by a long-term PSK from a
+    /// pairing record. Sessions keyed by the pairing PSK or the Sentinel
+    /// PSK are unpaired. Derived from the matched PSK, never sent on the wire.
+    pub paired: bool,
     /// The negotiated cipher suite
     pub suite: CipherSuite,
     /// Activities from the initial `server/activate`
@@ -123,7 +122,7 @@ pub struct Connection {
     /// the consumer falls behind.
     pub audio: Receiver<AudioChunk>,
     /// Artwork chunks from the server. Bounded with drop-on-full.
-    pub artwork: Receiver<ArtworkChunk>,
+    pub artwork: Receiver<ArtworkMessage>,
     /// Visualizer chunks from the server. Bounded with drop-on-full.
     pub visualizer: Receiver<VisualizerChunk>,
     /// Clock synchronization state
@@ -290,7 +289,7 @@ impl Drop for ConnectionGuard {
 pub struct ProtocolClient {
     sender: WsSender,
     audio_rx: Receiver<AudioChunk>,
-    artwork_rx: Receiver<ArtworkChunk>,
+    artwork_rx: Receiver<ArtworkMessage>,
     visualizer_rx: Receiver<VisualizerChunk>,
     message_rx: Receiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
@@ -497,20 +496,38 @@ impl ProtocolClient {
         let psk_payload: NoiseMessage1Payload = serde_json::from_slice(&payload)
             .map_err(|e| Error::Protocol(format!("malformed noise message 1 payload: {e}")))?;
 
-        let candidate = select_psk(&config.psk_candidates, &psk_payload.psk_id)
-            .ok_or_else(|| Error::Crypto("psk_id lookup miss".to_string()))?
-            .clone();
-        // Stored-pubkey model: the matched record must be bound to this server.
-        if let PskCategory::LongTerm {
-            server_id: Some(bound),
-        } = &candidate.category
-        {
-            if *bound != server_init.server_id {
-                return Err(Error::Crypto(
-                    "matched PSK is bound to a different server_id".to_string(),
-                ));
+        let candidate = match select_psk(
+            &config.psk_candidates,
+            &psk_payload.psk_id,
+            psk_payload.psk_category,
+        ) {
+            Some(candidate) => {
+                // A long-term record must be bound to this server. A failed
+                // binding check is a misbinding, not a miss: it fails the
+                // handshake rather than falling back to the Sentinel.
+                if let PskCategory::LongTerm { server_id: bound } = &candidate.category {
+                    if *bound != server_init.server_id {
+                        return Err(Error::Crypto(
+                            "matched PSK is bound to a different server_id".to_string(),
+                        ));
+                    }
+                }
+                candidate.clone()
             }
-        }
+            None => {
+                // Sentinel Fallback (initial handshake only): complete the
+                // handshake with the Sentinel PSK instead of failing. The
+                // session proceeds as an ordinary unpaired connection.
+                log::info!(
+                    "psk_id lookup miss ({:?}); falling back to the Sentinel PSK",
+                    psk_payload.psk_category
+                );
+                PskCandidate {
+                    psk: Psk::sentinel(),
+                    category: PskCategory::Sentinel,
+                }
+            }
+        };
 
         // Noise message 2 (client → server): payload is the literal `{}`.
         let msg2 = handshake.write_message_2(&candidate.psk)?;
@@ -541,9 +558,7 @@ impl ProtocolClient {
             server_init.server_id
         );
 
-        let trust_level = trust_level_for(&candidate.category);
-        let hello =
-            Message::ClientHello(config.hello.to_hello(trust_level, config.unpaired_access));
+        let hello = Message::ClientHello(config.hello.to_hello(config.unpaired_access));
         send_encrypted(write, &channel, OutboundPayload::Json(Box::new(hello))).await?;
 
         let Message::ServerActivate(activate) = next_app_message(read, &channel).await? else {
@@ -595,7 +610,7 @@ impl ProtocolClient {
         let session = SessionInfo {
             server_id: server_init.server_id,
             server_name: server_hello.name,
-            trust_level,
+            paired: matches!(candidate.category, PskCategory::LongTerm { .. }),
             suite: config.suite,
             initial_activities: activate.activities,
             initial_active_roles: roles,
@@ -631,9 +646,8 @@ impl ProtocolClient {
             suite,
             psk_candidates,
             store,
-            pairing_psk,
-            record_mode,
-            initial_state,
+            mut initial_state,
+            max_encoded_artwork_transfer_bytes,
             clock,
             unpaired_access,
             hello,
@@ -644,10 +658,29 @@ impl ProtocolClient {
             store.mark_used(&candidate.psk.psk_id());
         }
 
+        // A player or source may report `available: true` only after the
+        // clock filter has synchronized. Keep the requested value so the sync
+        // path can publish it once the first usable samples arrive.
+        let requested_available = initial_state.available;
+        let requires_clock_sync = hello
+            .supported_roles
+            .iter()
+            .any(|role| role == "player@v1" || role == "source@v1");
+        if requires_clock_sync && requested_available {
+            initial_state.available = false;
+        }
+
         let shared = Arc::new(SharedSessionState::new(
             session.server_id.clone(),
             session.initial_activities.clone(),
             session.initial_active_roles.clone(),
+            initial_state,
+            requested_available,
+            requires_clock_sync,
+            hello
+                .player_v1_support
+                .as_ref()
+                .map_or_else(Vec::new, |support| support.supported_formats.clone()),
         ));
         let (gate_tx, gate_rx) = watch::channel(true);
         let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
@@ -657,7 +690,6 @@ impl ProtocolClient {
         let (visualizer_tx, visualizer_rx) = mpsc::channel(VISUALIZER_CHANNEL_CAPACITY);
         let (message_tx, message_rx) = mpsc::channel(MESSAGE_CHANNEL_CAPACITY);
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
-
         let writer_handle = tokio::spawn(writer_task(
             write,
             Arc::clone(&channel),
@@ -677,21 +709,16 @@ impl ProtocolClient {
             server_public,
             server_id: session.server_id.clone(),
             hello,
-            management: ManagementState {
-                store,
-                pairing_psk_enabled: pairing_psk.is_some(),
-                pairing_psk,
-                unpaired_access,
-                record_mode,
-            },
+            store,
+            unpaired_access,
             candidates: psk_candidates,
             current: candidate,
             pending_pairing: None,
             pairing_deadline: None,
             activities: session.initial_activities.clone(),
             persisted_roles: session.initial_active_roles.clone(),
-            initial_state,
             state_sent: false,
+            rehandshake_in_progress: false,
             shared: Arc::clone(&shared),
         };
 
@@ -701,10 +728,7 @@ impl ProtocolClient {
         let pairing_session = session.initial_activities.contains(&Activity::Pairing);
         if !pairing_session {
             log::debug!("Sending initial client/state");
-            enqueue_json(
-                &out_tx,
-                Message::ClientState(session_state.initial_state.clone()),
-            );
+            enqueue_json(&out_tx, Message::ClientState(shared.client_state()));
             session_state.state_sent = true;
         } else if session_state.current.category == PskCategory::Pairing {
             // Pairing PSK flow: the client starts the attempt by delivering a
@@ -729,6 +753,7 @@ impl ProtocolClient {
             },
             session_state,
             session_io,
+            max_encoded_artwork_transfer_bytes,
         ));
 
         // First two samples fire 10ms apart so an offset estimate (and
@@ -784,11 +809,14 @@ impl ProtocolClient {
         mut io: RouterChannels,
         mut session: SessionState,
         session_io: SessionIo,
+        max_encoded_artwork_transfer_bytes: usize,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut audio_closed = false;
         let mut artwork_closed = false;
+        let mut artwork_assembler =
+            crate::protocol::binary::ArtworkAssembler::new(max_encoded_artwork_transfer_bytes);
         let mut visualizer_closed = false;
         let mut message_closed = false;
         let mut audio_chunk_count = 0u64;
@@ -850,12 +878,26 @@ impl ProtocolClient {
                                 // message_rx consumers — it's an internal
                                 // protocol detail arriving at 1Hz.
                                 if let Message::ServerTime(ref st) = msg {
-                                    io.clock_sync.lock().update(
-                                        st.client_transmitted,
-                                        st.server_received,
-                                        st.server_transmitted,
-                                        t4,
-                                    );
+                                    let became_synchronized = {
+                                        let mut clock_sync = io.clock_sync.lock();
+                                        let was_synchronized = clock_sync.is_synchronized();
+                                        clock_sync.update(
+                                            st.client_transmitted,
+                                            st.server_received,
+                                            st.server_transmitted,
+                                            t4,
+                                        );
+                                        !was_synchronized && clock_sync.is_synchronized()
+                                    };
+                                    if became_synchronized
+                                        && session.shared.set_clock_synchronized()
+                                        && !session.activities.contains(&Activity::Pairing)
+                                    {
+                                        enqueue_json(
+                                            &session_io.out_tx,
+                                            Message::ClientState(session.shared.client_state()),
+                                        );
+                                    }
                                     continue;
                                 }
                                 log::debug!("Received message: {:?}", msg);
@@ -877,6 +919,38 @@ impl ProtocolClient {
                             }
                             Err(e) => {
                                 log::warn!("Failed to parse message: {}", e);
+                            }
+                        }
+                        continue;
+                    }
+                    // Artwork (types 8-11) runs the stateful transfer
+                    // protocol; malformed sequences close the connection.
+                    if binary_types::is_artwork(msg_type) {
+                        let mut frame = Vec::with_capacity(1 + payload.len());
+                        frame.push(msg_type);
+                        frame.extend_from_slice(&payload);
+                        match artwork_assembler.handle(&frame) {
+                            Ok(None) => {}
+                            Ok(Some(event)) => {
+                                log::trace!("Artwork event: {event:?}");
+                                if !artwork_closed {
+                                    match io.artwork_tx.try_send(event) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            log::warn!("Artwork receiver full — dropping event");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            log::error!(
+                                                "Artwork receiver dropped — artwork data will be discarded"
+                                            );
+                                            artwork_closed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Artwork protocol error: {e}; closing connection");
+                                break;
                             }
                         }
                         continue;
@@ -911,32 +985,6 @@ impl ProtocolClient {
                                             "Audio receiver dropped — audio data will be discarded"
                                         );
                                         audio_closed = true;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(BinaryFrame::Artwork(chunk)) => {
-                            // Artwork arrives in short bursts on track
-                            // changes, so every chunk is worth a line; audio
-                            // and visualizer chunks stream continuously and
-                            // are sampled instead.
-                            log::trace!(
-                                "Received artwork chunk: channel={}, timestamp={}µs, payload_bytes={}",
-                                chunk.channel,
-                                chunk.timestamp,
-                                chunk.data.len()
-                            );
-                            if !artwork_closed {
-                                match io.artwork_tx.try_send(chunk) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        log::warn!("Artwork receiver full — dropping chunk");
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        log::error!(
-                                            "Artwork receiver dropped — artwork data will be discarded"
-                                        );
-                                        artwork_closed = true;
                                     }
                                 }
                             }
@@ -1061,7 +1109,7 @@ impl ProtocolClient {
 struct RouterChannels {
     channel: Arc<Mutex<EncryptedChannel>>,
     audio_tx: Sender<AudioChunk>,
-    artwork_tx: Sender<ArtworkChunk>,
+    artwork_tx: Sender<ArtworkMessage>,
     visualizer_tx: Sender<VisualizerChunk>,
     message_tx: Sender<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,

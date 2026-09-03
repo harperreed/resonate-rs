@@ -1,6 +1,6 @@
 mod common;
 
-use common::MockServer;
+use common::{test_credentials, MockServer};
 use sendspin::protocol::messages::{Activity, ClientCommand, Message};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use tokio_tungstenite::connect_async;
 
 async fn listener(path: Option<&str>) -> sendspin::ProtocolListener {
     let listener = ProtocolClientBuilder::builder()
+        .credentials(test_credentials())
         .name("Inbound Client".into())
         .build()
         .listen("127.0.0.1:0")

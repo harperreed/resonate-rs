@@ -1,11 +1,12 @@
 mod common;
 
-use common::MockServer;
+use common::{test_credentials, MockServer};
 use sendspin::error::Error;
 use sendspin::protocol::messages::{
-    Activity, ArtworkFormatRequest, ClientGoodbye, ClientState, ControllerCommandType,
-    GoodbyeReason, GroupUpdate, Message, PlaybackState, PlayerFormatRequest, PlayerState,
-    RepeatMode, ServerActivate, StreamEnd, StreamPlayerConfig, StreamStart,
+    Activity, ArtworkChannelConfig, ArtworkSource, ArtworkState, AudioFormatSpec, ClientGoodbye,
+    ClientState, ControllerCommandType, GoodbyeReason, GroupUpdate, ImageFormat, Message,
+    PlaybackState, PlayerState, PlayerV1Support, RepeatMode, ServerActivate, VisualizerDataType,
+    VisualizerState,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -37,6 +38,7 @@ async fn next_server_message(server: &mut MockServer) -> Message {
 async fn connect_completes_noise_handshake_and_exposes_session() {
     let (connection, server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("Integration Client".into())
             .build(),
         vec!["player@v1"],
@@ -48,13 +50,85 @@ async fn connect_completes_noise_handshake_and_exposes_session() {
         vec![Activity::Playback]
     );
     assert_eq!(connection.session.initial_active_roles, vec!["player@v1"]);
-    assert_eq!(
-        connection.session.trust_level,
-        sendspin::protocol::messages::TrustLevel::None
-    );
+    assert!(!connection.session.paired);
     assert_eq!(connection.session.server_id.len(), 43);
     drop(connection);
     drop(server);
+}
+
+#[tokio::test]
+async fn initial_player_state_waits_for_clock_sync() {
+    let (connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Sync-gated Client".into())
+            .build(),
+        vec!["player@v1"],
+    )
+    .await;
+
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientState(ClientState {
+            available: false,
+            player: Some(_),
+            ..
+        })
+    ));
+    assert!(timeout(Duration::from_millis(5), server.recv_json())
+        .await
+        .is_err());
+
+    let synced = timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(server.recv_json().await.unwrap(), Message::ClientState(state) if state.available)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        synced.is_ok(),
+        "available=true was not sent after clock sync"
+    );
+    drop(connection);
+}
+
+#[tokio::test]
+async fn initial_source_state_waits_for_clock_sync() {
+    let (connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Sync-gated Source".into())
+            .source_v1_support(Default::default())
+            .build(),
+        vec!["source@v1"],
+    )
+    .await;
+
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientState(ClientState {
+            available: false,
+            source: None,
+            ..
+        })
+    ));
+    let synced = timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(server.recv_json().await.unwrap(), Message::ClientState(state) if state.available)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        synced.is_ok(),
+        "available=true was not sent after clock sync"
+    );
+    drop(connection);
 }
 
 #[tokio::test]
@@ -65,6 +139,7 @@ async fn initial_state_and_external_source_transitions_are_serialized() {
     };
     let (connection, mut server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("State Client".into())
             .initial_available(false)
             .initial_player_state(player.clone())
@@ -77,7 +152,9 @@ async fn initial_state_and_external_source_transitions_are_serialized() {
         Message::ClientState(ClientState {
             available: false,
             player: Some(_),
-            source: None
+            source: None,
+            artwork: None,
+            visualizer: None
         })
     ));
     connection.enter_external_source().await.unwrap();
@@ -86,21 +163,33 @@ async fn initial_state_and_external_source_transitions_are_serialized() {
         Message::ClientState(ClientState {
             available: false,
             player: None,
-            source: None
+            source: None,
+            artwork: None,
+            visualizer: None
         })
     ));
     connection
         .exit_external_source(Some(player.clone()))
         .await
         .unwrap();
-    assert!(matches!(
-        next_server_message(&mut server).await,
-        Message::ClientState(ClientState {
-            available: true,
-            player: Some(_),
-            source: None
-        })
-    ));
+    let became_available = timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                next_server_message(&mut server).await,
+                Message::ClientState(ClientState {
+                    available: true,
+                    player: Some(_),
+                    source: None,
+                    artwork: None,
+                    visualizer: None
+                })
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(became_available.is_ok());
     drop(connection);
 }
 
@@ -108,6 +197,7 @@ async fn initial_state_and_external_source_transitions_are_serialized() {
 async fn disconnect_sends_goodbye_and_closes_socket() {
     let (connection, mut server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("Disconnecting".into())
             .build(),
         vec!["player@v1"],
@@ -132,115 +222,123 @@ async fn disconnect_sends_goodbye_and_closes_socket() {
 }
 
 #[tokio::test]
-async fn stream_format_requests_are_gated_by_active_streams() {
-    let (mut connection, mut server) = connected(
+async fn initial_state_includes_player_artwork_and_visualizer_objects() {
+    let (connection, mut server) = connected(
         ProtocolClientBuilder::builder()
-            .name("Formats".into())
+            .credentials(test_credentials())
+            .name("State objects".into())
+            .player_v1_support(PlayerV1Support {
+                supported_formats: vec![AudioFormatSpec {
+                    codec: "pcm".into(),
+                    channels: 2,
+                    sample_rate: 48_000,
+                    bit_depth: 16,
+                }],
+                buffer_capacity: 1024,
+            })
+            .artwork_state(ArtworkState {
+                channels: vec![ArtworkChannelConfig {
+                    source: ArtworkSource::Album,
+                    format: Some(ImageFormat::Png),
+                    width: Some(64),
+                    height: Some(64),
+                }],
+            })
+            .visualizer_v1_support(sendspin::protocol::messages::VisualizerV1Support {
+                buffer_capacity: 100,
+            })
+            .visualizer_state(VisualizerState {
+                types: vec![VisualizerDataType::Loudness],
+                rate_max: 10,
+                spectrum: None,
+            })
+            .build(),
+        vec!["player@v1", "artwork@v1", "visualizer@v1"],
+    )
+    .await;
+    match next_server_message(&mut server).await {
+        Message::ClientState(ClientState {
+            player: Some(player),
+            artwork: Some(artwork),
+            visualizer: Some(visualizer),
+            ..
+        }) => {
+            assert_eq!(player.volume, Some(100));
+            assert_eq!(artwork.channels.len(), 1);
+            assert_eq!(visualizer.types, vec![VisualizerDataType::Loudness]);
+        }
+        other => panic!("expected complete initial state, got {other:?}"),
+    }
+    drop(connection);
+}
+
+#[tokio::test]
+async fn invalid_runtime_player_state_is_rejected_without_sending() {
+    let (connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Validation".into())
+            .initial_available(false)
             .build(),
         vec!["player@v1"],
     )
     .await;
     let _ = next_server_message(&mut server).await;
-    let request = PlayerFormatRequest {
-        codec: Some("pcm".into()),
-        channels: None,
-        sample_rate: None,
-        bit_depth: None,
+    let invalid = PlayerState {
+        output_delay_ms: 5001,
+        ..Default::default()
     };
     assert!(matches!(
-        connection.sender.request_stream_format(None, None).await,
-        Err(Error::Protocol(_))
+        connection.sender.update_player_state(invalid).await,
+        Err(Error::Protocol(message)) if message.contains("output_delay_ms")
     ));
-    assert!(matches!(
-        connection
-            .sender
-            .request_stream_format(Some(request.clone()), None)
-            .await,
-        Err(Error::Protocol(_))
-    ));
-    assert!(matches!(
-        connection
-            .sender
-            .request_stream_format(
-                None,
-                Some(ArtworkFormatRequest {
-                    channel: 0,
-                    source: None,
-                    format: None,
-                    media_width: None,
-                    media_height: None
-                })
-            )
-            .await,
-        Err(Error::Protocol(_))
-    ));
-    server
-        .send_json(Message::StreamStart(StreamStart {
-            server_transmitted: 1,
-            player: Some(StreamPlayerConfig {
-                codec: "pcm".into(),
-                sample_rate: 48000,
-                channels: 2,
-                bit_depth: 16,
-                codec_header: None,
-            }),
-            artwork: None,
-            visualizer: None,
-        }))
+    assert!(timeout(Duration::from_millis(50), server.recv_json())
         .await
-        .unwrap();
+        .is_err());
+}
+
+#[tokio::test]
+async fn player_state_updates_are_full_state_messages() {
+    let (connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Formats".into())
+            .build(),
+        vec!["player@v1"],
+    )
+    .await;
+    let initial = next_server_message(&mut server).await;
     assert!(matches!(
-        timeout(Duration::from_secs(2), connection.messages.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        Message::StreamStart(_)
+        initial,
+        Message::ClientState(ClientState {
+            player: Some(_),
+            ..
+        })
     ));
     connection
         .sender
-        .request_stream_format(Some(request), None)
+        .set_player_format(Some(AudioFormatSpec {
+            codec: "pcm".into(),
+            channels: 2,
+            sample_rate: 48_000,
+            bit_depth: 16,
+        }))
         .await
         .unwrap();
     assert!(matches!(
         next_server_message(&mut server).await,
-        Message::StreamRequestFormat(_)
+        Message::ClientState(ClientState {
+            player: Some(_),
+            ..
+        })
     ));
-    server
-        .send_json(Message::StreamEnd(StreamEnd {
-            server_transmitted: 2,
-            roles: None,
-        }))
-        .await
-        .unwrap();
-    assert!(matches!(
-        timeout(Duration::from_secs(2), connection.messages.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        Message::StreamEnd(_)
-    ));
-    assert!(matches!(
-        connection
-            .sender
-            .request_stream_format(
-                Some(PlayerFormatRequest {
-                    codec: None,
-                    channels: Some(1),
-                    sample_rate: None,
-                    bit_depth: None
-                }),
-                None
-            )
-            .await,
-        Err(Error::Protocol(_))
-    ));
-    drop(connection);
 }
 
 #[tokio::test]
 async fn controller_commands_wire_and_live_activation_updates_roles() {
     let (connection, mut server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("Controller".into())
             .controller()
             .build(),
@@ -290,6 +388,7 @@ async fn controller_commands_wire_and_live_activation_updates_roles() {
 async fn controller_denial_and_later_live_role_activation() {
     let (mut connection, mut server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("Controller".into())
             .controller()
             .build(),
@@ -331,6 +430,7 @@ async fn controller_denial_and_later_live_role_activation() {
 
     let (connection, _server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("No Controller".into())
             .build(),
         vec!["player@v1", "controller@v1"],
@@ -344,6 +444,7 @@ async fn controller_denial_and_later_live_role_activation() {
 async fn encrypted_audio_json_forward_and_server_time_is_consumed() {
     let (mut connection, server) = connected(
         ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
             .name("Receiver".into())
             .build(),
         vec!["player@v1"],
@@ -358,9 +459,9 @@ async fn encrypted_audio_json_forward_and_server_time_is_consumed() {
     assert_eq!(&*audio.data, &[1, 2, 3, 4]);
     server
         .send_json(Message::GroupUpdate(GroupUpdate {
-            playback_state: Some(PlaybackState::Playing),
-            group_id: Some("g".into()),
-            group_name: None,
+            playback_state: PlaybackState::Playing,
+            group_id: "g".into(),
+            group_name: "Group".into(),
         }))
         .await
         .unwrap();

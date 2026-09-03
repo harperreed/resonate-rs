@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sendspin::protocol::messages::PlayerState;
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 
 /// Minimal Sendspin test client
 #[derive(Parser, Debug)]
@@ -21,15 +21,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Connecting to {}...", args.server);
+    // Persist credentials.to_bytes() in application-owned secure storage and
+    // restore them with ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
     let test = ProtocolClientBuilder::builder()
+        .credentials(credentials)
         .name("Minimal Test Client".to_string())
         .initial_player_state(PlayerState {
             volume: Some(100),
             muted: Some(false),
-            output_delay_ms: Some(0),
-            required_lead_time_ms: Some(500),
-            min_buffer_ms: Some(500),
-            supported_commands: None,
+            output_delay_ms: 0,
+            required_lead_time_ms: 500,
+            min_buffer_ms: 500,
+            supported_commands: Vec::new(),
+            format: None,
         })
         .build();
 

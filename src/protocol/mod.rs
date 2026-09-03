@@ -11,8 +11,6 @@ pub mod client_builder;
 pub mod crypto;
 /// Inbound WebSocket acceptor for server-initiated connections
 pub mod listener;
-/// Client-side handling of management requests
-pub(crate) mod management;
 /// Managed connection lifecycle: multi-server arbitration and auto-goodbye
 pub mod manager;
 /// Protocol message type definitions and serialization

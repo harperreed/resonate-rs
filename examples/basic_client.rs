@@ -2,7 +2,7 @@
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
 
 use clap::Parser;
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 
 /// Sendspin basic client
 #[derive(Parser, Debug)]
@@ -26,7 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
 
+    // Persist credentials.to_bytes() in application-owned secure storage and
+    // restore them with ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
     let test = ProtocolClientBuilder::builder()
+        .credentials(credentials)
         .name(args.name.clone())
         .build();
 

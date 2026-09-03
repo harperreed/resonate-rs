@@ -10,10 +10,9 @@
 use crate::error::Error;
 use crate::protocol::binary::binary_types;
 use crate::protocol::messages::{
-    Activity, ArtworkFormatRequest, ClientCommand, ClientState, ClientStreamEnd, ClientStreamStart,
-    ControllerCommand, ControllerCommandType, Message, PlayerFormatRequest, PlayerState,
-    RepeatMode, SourceStreamConfig, StreamEnd, StreamRequestFormat, StreamStart,
-    VisualizerFormatRequest,
+    Activity, ArtworkState, AudioFormatSpec, ClientCommand, ClientState, ClientStreamEnd,
+    ClientStreamStart, ControllerCommand, ControllerCommandType, Message, PlayerState, RepeatMode,
+    SourceStreamConfig, StreamEnd, StreamStart, VisualizerState,
 };
 use crate::protocol::writer::{OutboundPayload, WriteCommand};
 use parking_lot::RwLock;
@@ -64,24 +63,20 @@ impl StreamState {
             self.visualizer_active.store(false, Ordering::Release);
         }
     }
-
-    fn is_player_active(&self) -> bool {
-        self.player_active.load(Ordering::Acquire)
-    }
-
-    fn is_artwork_active(&self) -> bool {
-        self.artwork_active.load(Ordering::Acquire)
-    }
-
-    fn is_visualizer_active(&self) -> bool {
-        self.visualizer_active.load(Ordering::Acquire)
-    }
 }
 
 fn role_ended(end: &StreamEnd, role: &str) -> bool {
     end.roles
         .as_ref()
         .is_none_or(|roles| roles.iter().any(|r| r == role))
+}
+
+/// Availability request and clock-sync state. Both transitions are serialized
+/// with the canonical client-state update by `SharedSessionState`.
+#[derive(Debug)]
+struct AvailabilityState {
+    requested: bool,
+    synchronized: bool,
 }
 
 /// Live, mutable session facts maintained by the message router.
@@ -101,10 +96,28 @@ pub(crate) struct SharedSessionState {
     server_id: String,
     stream: StreamState,
     live: RwLock<LiveSession>,
+    /// The canonical client state: every `client/state` this library sends
+    /// carries full role objects drawn from (and recorded into) this copy.
+    client_state: RwLock<ClientState>,
+    /// Availability request and synchronization state, serialized with the
+    /// canonical client-state transition.
+    availability: RwLock<AvailabilityState>,
+    /// Whether a player role requires clock synchronization before availability.
+    requires_clock_sync: bool,
+    /// Formats declared by the player role in `client/hello`.
+    supported_formats: Vec<AudioFormatSpec>,
 }
 
 impl SharedSessionState {
-    pub(crate) fn new(server_id: String, activities: Vec<Activity>, roles: Vec<String>) -> Self {
+    pub(crate) fn new(
+        server_id: String,
+        activities: Vec<Activity>,
+        roles: Vec<String>,
+        client_state: ClientState,
+        requested_available: bool,
+        requires_clock_sync: bool,
+        supported_formats: Vec<AudioFormatSpec>,
+    ) -> Self {
         Self {
             server_id,
             stream: StreamState::default(),
@@ -113,7 +126,70 @@ impl SharedSessionState {
                 active_roles: roles,
                 pairing_attempt: false,
             }),
+            client_state: RwLock::new(client_state),
+            availability: RwLock::new(AvailabilityState {
+                requested: requested_available,
+                synchronized: false,
+            }),
+            requires_clock_sync,
+            supported_formats,
         }
+    }
+
+    /// A snapshot of the canonical client state.
+    pub(crate) fn client_state(&self) -> ClientState {
+        self.client_state.read().clone()
+    }
+
+    /// Mutate the canonical client state and return the updated snapshot.
+    pub(crate) fn update_client_state(&self, f: impl FnOnce(&mut ClientState)) -> ClientState {
+        let mut state = self.client_state.write();
+        f(&mut state);
+        state.clone()
+    }
+
+    pub(crate) fn set_clock_synchronized(&self) -> bool {
+        let mut availability = self.availability.write();
+        if availability.synchronized {
+            return false;
+        }
+        availability.synchronized = true;
+        let effective = availability.requested;
+        if self.requires_clock_sync && effective {
+            self.client_state.write().available = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn update_available_state(
+        &self,
+        requested: bool,
+        update: impl FnOnce(&mut ClientState),
+    ) -> ClientState {
+        let mut availability = self.availability.write();
+        availability.requested = requested;
+        let effective = requested && (!self.requires_clock_sync || availability.synchronized);
+        let mut state = self.client_state.write();
+        update(&mut state);
+        state.available = effective;
+        state.clone()
+    }
+
+    pub(crate) fn format_supported(&self, format: &AudioFormatSpec) -> bool {
+        self.supported_formats
+            .iter()
+            .any(|supported| supported == format)
+    }
+
+    #[cfg(test)]
+    fn availability_state(&self) -> (bool, bool, bool) {
+        let availability = self.availability.read();
+        (
+            availability.requested,
+            availability.synchronized,
+            self.client_state.read().available,
+        )
     }
 
     pub(crate) fn server_id(&self) -> &str {
@@ -246,10 +322,10 @@ impl WsSender {
 
     /// Send a top-level availability update.
     pub async fn send_available(&self, available: bool) -> Result<(), Error> {
+        let snapshot = self.shared.update_available_state(available, |_| {});
         self.send_message(Message::ClientState(ClientState {
-            available,
-            player: None,
-            source: None,
+            available: snapshot.available,
+            ..Default::default()
         }))
         .await
     }
@@ -271,104 +347,134 @@ impl WsSender {
     /// must be read through platform APIs; this library only tracks its own
     /// software [`GainControl`](crate::audio::GainControl).
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
-        self.send_message(Message::ClientState(ClientState {
-            available: true,
-            player,
-            source: None,
-        }))
-        .await
-    }
-
-    /// Request a change to the active stream format.
-    ///
-    /// Sendspin servers may use this advisory message to switch codecs,
-    /// sample rates, artwork dimensions, or other stream properties in
-    /// response to changing network, CPU, or display conditions. Fields left
-    /// as `None` are unconstrained by the client.
-    ///
-    /// This low-level sender does not enforce negotiated roles; callers should
-    /// only use it for connections where the server granted the requested role.
-    /// Use [`Connection::active_roles`](crate::Connection::active_roles) when
-    /// you need to inspect the live roles before sending.
-    ///
-    /// A requested component is rejected unless that role's stream is currently
-    /// active (between its `stream/start` and `stream/end`): there is nothing to
-    /// renegotiate for a role the server is not streaming.
-    pub async fn request_stream_format(
-        &self,
-        player: Option<PlayerFormatRequest>,
-        artwork: Option<ArtworkFormatRequest>,
-    ) -> Result<(), Error> {
-        self.request_stream_formats(player, artwork, None).await
-    }
-
-    /// Request changes to any combination of active stream formats.
-    ///
-    /// Each supplied component must have a corresponding active stream. The
-    /// existing [`Self::request_stream_format`] method remains available for
-    /// player/artwork-only callers.
-    pub async fn request_stream_formats(
-        &self,
-        player: Option<PlayerFormatRequest>,
-        artwork: Option<ArtworkFormatRequest>,
-        visualizer: Option<VisualizerFormatRequest>,
-    ) -> Result<(), Error> {
-        if player.is_none() && artwork.is_none() && visualizer.is_none() {
-            return Err(Error::Protocol(
-                "stream/request-format requires a player, artwork, or visualizer request"
-                    .to_string(),
-            ));
-        }
-
-        if let Some(request) = visualizer.as_ref() {
-            request
+        if let Some(player) = player.as_ref() {
+            player
                 .validate()
                 .map_err(|message| Error::Protocol(message.to_string()))?;
+            if player
+                .format
+                .as_ref()
+                .is_some_and(|format| !self.shared.format_supported(format))
+            {
+                return Err(Error::Protocol(
+                    "player format is not in supported_formats".to_string(),
+                ));
+            }
         }
-
-        if player.is_some() && !self.shared.stream().is_player_active() {
-            return Err(Error::Protocol(
-                "stream/request-format requires an active player stream".to_string(),
-            ));
-        }
-
-        if artwork.is_some() && !self.shared.stream().is_artwork_active() {
-            return Err(Error::Protocol(
-                "stream/request-format requires an active artwork stream".to_string(),
-            ));
-        }
-
-        if visualizer.is_some() && !self.shared.stream().is_visualizer_active() {
-            return Err(Error::Protocol(
-                "stream/request-format requires an active visualizer stream".to_string(),
-            ));
-        }
-
-        self.send_message(Message::StreamRequestFormat(StreamRequestFormat {
-            player,
-            artwork,
-            visualizer,
+        let snapshot = self.shared.update_available_state(true, |state| {
+            if let Some(player) = player {
+                state.player = Some(player);
+            }
+        });
+        self.send_message(Message::ClientState(ClientState {
+            available: snapshot.available,
+            player: snapshot.player,
+            ..Default::default()
         }))
         .await
     }
 
-    /// Request a change to the active player/audio stream format.
-    pub async fn request_player_format(&self, player: PlayerFormatRequest) -> Result<(), Error> {
-        self.request_stream_format(Some(player), None).await
+    /// Report a full player state update (`client/state` player object).
+    ///
+    /// Stream configuration is derived from client state: when the player's
+    /// `format` preference changes while a player stream is active, the
+    /// server re-derives the stream format and re-issues `stream/start` if it
+    /// changed; with no active stream, the preference applies to the next
+    /// stream. Timing fields (`required_lead_time_ms`, `min_buffer_ms`,
+    /// `output_delay_ms`) feed the server's send-ahead planning.
+    pub async fn update_player_state(&self, player: PlayerState) -> Result<(), Error> {
+        player
+            .validate()
+            .map_err(|message| Error::Protocol(message.to_string()))?;
+        if player
+            .format
+            .as_ref()
+            .is_some_and(|format| !self.shared.format_supported(format))
+        {
+            return Err(Error::Protocol(
+                "player format is not in supported_formats".to_string(),
+            ));
+        }
+        let snapshot = self
+            .shared
+            .update_client_state(|state| state.player = Some(player));
+        self.send_client_state_roles(ClientState {
+            player: snapshot.player,
+            ..Default::default()
+        })
+        .await
     }
 
-    /// Request a change to an active artwork stream format.
-    pub async fn request_artwork_format(&self, artwork: ArtworkFormatRequest) -> Result<(), Error> {
-        self.request_stream_format(None, Some(artwork)).await
+    /// Change (or clear) the player's preferred audio format.
+    ///
+    /// The format must be one of the `supported_formats` declared in
+    /// `client/hello`; `None` restores the server's priority-order selection.
+    /// Requires a player object to have been reported (the builder seeds one
+    /// for player clients).
+    pub async fn set_player_format(&self, format: Option<AudioFormatSpec>) -> Result<(), Error> {
+        if format
+            .as_ref()
+            .is_some_and(|format| !self.shared.format_supported(format))
+        {
+            return Err(Error::Protocol(
+                "player format is not in supported_formats".to_string(),
+            ));
+        }
+        let snapshot = self.shared.update_client_state(|state| {
+            if let Some(player) = state.player.as_mut() {
+                player.format = format;
+            }
+        });
+        let Some(player) = snapshot.player else {
+            return Err(Error::Protocol(
+                "no player state to carry a format preference".to_string(),
+            ));
+        };
+        self.send_client_state_roles(ClientState {
+            player: Some(player),
+            ..Default::default()
+        })
+        .await
     }
 
-    /// Request a change to an active visualizer stream format.
-    pub async fn request_visualizer_format(
-        &self,
-        visualizer: VisualizerFormatRequest,
-    ) -> Result<(), Error> {
-        self.request_stream_formats(None, None, Some(visualizer))
-            .await
+    /// Report a full artwork channel configuration (`client/state` artwork
+    /// object). Channels are positional from channel 0 (at most 4); a channel
+    /// the array does not cover is `source: 'none'`.
+    pub async fn update_artwork_state(&self, artwork: ArtworkState) -> Result<(), Error> {
+        artwork
+            .validate()
+            .map_err(|message| Error::Protocol(message.to_string()))?;
+        let snapshot = self
+            .shared
+            .update_client_state(|state| state.artwork = Some(artwork));
+        self.send_client_state_roles(ClientState {
+            artwork: snapshot.artwork,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Report a full visualizer configuration (`client/state` visualizer
+    /// object): requested data types, frame-rate cap, and spectrum layout.
+    pub async fn update_visualizer_state(&self, visualizer: VisualizerState) -> Result<(), Error> {
+        visualizer
+            .validate()
+            .map_err(|message| Error::Protocol(message.to_string()))?;
+        let snapshot = self
+            .shared
+            .update_client_state(|state| state.visualizer = Some(visualizer));
+        self.send_client_state_roles(ClientState {
+            visualizer: snapshot.visualizer,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Send a `client/state` carrying the given role objects plus the
+    /// canonical `available` flag.
+    async fn send_client_state_roles(&self, mut state: ClientState) -> Result<(), Error> {
+        state.available = self.shared.client_state().available;
+        self.send_message(Message::ClientState(state)).await
     }
 
     /// Enqueue a farewell message (goodbye or pair/abort) followed by a
@@ -541,8 +647,7 @@ impl Controller {
 
 /// Source handle for streaming captured audio to the server.
 ///
-/// Present when the client declared the `source@v1` role in `client/hello`
-/// (which the admission rules restrict to paired, `user`-trust sessions);
+/// Present when the client declared the `source@v1` role in `client/hello`;
 /// each send verifies the role is currently active. Obtained via
 /// [`ProtocolClient::split()`](crate::ProtocolClient::split).
 ///
@@ -569,7 +674,7 @@ impl Source {
         Ok(())
     }
 
-    /// Announce the active input stream format (`client_stream/start`).
+    /// Announce the active input stream format (`client-stream/start`).
     /// Must be sent before the first audio chunk; re-sending replaces the
     /// format in place.
     pub async fn start_stream(&self, config: SourceStreamConfig) -> Result<(), Error> {
@@ -581,7 +686,7 @@ impl Source {
             .await
     }
 
-    /// End the current input stream (`client_stream/end`).
+    /// End the current input stream (`client-stream/end`).
     pub async fn end_stream(&self) -> Result<(), Error> {
         self.require_role()?;
         self.sender
@@ -594,7 +699,7 @@ impl Source {
     /// `capture_timestamp_us` is the server-domain time the first sample was
     /// captured (invert the time filter's mapping to produce it). Chunks must
     /// carry whole codec units, be at most 150 ms long, and SHOULD be at
-    /// least 5 ms (the final chunk before `client_stream/end` may be shorter).
+    /// least 5 ms (the final chunk before `client-stream/end` may be shorter).
     pub async fn send_chunk(&self, capture_timestamp_us: i64, data: &[u8]) -> Result<(), Error> {
         self.require_role()?;
         let mut payload = Vec::with_capacity(8 + data.len());
@@ -603,5 +708,67 @@ impl Source {
         self.sender
             .send_binary(binary_types::SOURCE_AUDIO, payload)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn availability_request_after_sync_updates_canonical_state_atomically() {
+        let state = SharedSessionState::new(
+            "server".to_string(),
+            Vec::new(),
+            Vec::new(),
+            ClientState::default(),
+            true,
+            true,
+            Vec::new(),
+        );
+
+        assert!(state.set_clock_synchronized());
+        assert_eq!(state.availability_state(), (true, true, true));
+        let snapshot = state.update_available_state(false, |_| {});
+        assert!(!snapshot.available);
+        assert_eq!(state.availability_state(), (false, true, false));
+        let snapshot = state.update_available_state(true, |_| {});
+        assert!(snapshot.available);
+        assert_eq!(state.availability_state(), (true, true, true));
+    }
+
+    #[test]
+    fn external_source_rejects_unsupported_player_format() {
+        let state = Arc::new(SharedSessionState::new(
+            "server".to_string(),
+            Vec::new(),
+            Vec::new(),
+            ClientState::default(),
+            true,
+            false,
+            vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            }],
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_gate_tx, gate_rx) = watch::channel(true);
+        let sender = WsSender::new(tx, state, gate_rx);
+        let unsupported = PlayerState {
+            format: Some(AudioFormatSpec {
+                codec: "opus".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            }),
+            ..Default::default()
+        };
+
+        let result = tokio_test::block_on(sender.exit_external_source(Some(unsupported)));
+        assert!(
+            matches!(result, Err(Error::Protocol(message)) if message.contains("supported_formats"))
+        );
     }
 }

@@ -12,12 +12,15 @@
 //! the Pairing PSK distribution format. Version `1` carries a per-session
 //! 24-byte dynamic pairing code (QR emission; not yet implemented here).
 //!
-//! The **pairing record store** persists long-term Sendspin PSKs established
-//! by pairing. Records are either **stored-pubkey** (bound to a `server_id`)
-//! or **shared-PSK** (usable by any server holding the PSK).
+//! The **pairing record store** persists long-term PSKs established by
+//! pairing, each bound to the `server_id` it was established with. A client
+//! must be able to store at least 5 records; when a pairing completes at
+//! capacity the client evicts an existing record (implementation-defined,
+//! but never one backing a currently open connection) so the new record
+//! persists — a pairing never fails for lack of record storage.
 
 use crate::error::Error;
-use crate::protocol::crypto::{Identity, Psk, PskCandidate, PskCategory};
+use crate::protocol::crypto::{b64url_encode, Identity, Psk, PskCandidate, PskCategory};
 use crate::Result;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -89,9 +92,9 @@ fn decode_body(body: &str) -> Result<Vec<u8>> {
 /// Build a version-0 pairing token: `SP:0` + base32 body of
 /// `client_key (32) || pairing_psk (32)`.
 ///
-/// A client displays or prints this token so the operator can enter it into
-/// a server, which then verifies the embedded `client_key` against the
-/// connection's `client_id` and runs the Pairing PSK flow.
+/// A client displays or transfers this sensitive token so the operator can
+/// enter it into a server, which then verifies the embedded `client_key`
+/// against the connection's `client_id` and runs the Pairing PSK flow.
 pub fn pairing_psk_token(identity: &Identity, pairing_psk: &Psk) -> String {
     let mut payload = Vec::with_capacity(64);
     payload.extend_from_slice(identity.public_bytes());
@@ -100,7 +103,7 @@ pub fn pairing_psk_token(identity: &Identity, pairing_psk: &Psk) -> String {
 }
 
 /// A decoded pairing token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PairingToken {
     /// Version 0: a Pairing PSK with the client identity.
     PairingPsk {
@@ -114,6 +117,22 @@ pub enum PairingToken {
         /// The raw 24-byte pairing code.
         code: [u8; 24],
     },
+}
+
+impl std::fmt::Debug for PairingToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PairingPsk { client_key, .. } => f
+                .debug_struct("PairingPsk")
+                .field("client_key", &b64url_encode(client_key))
+                .field("pairing_psk", &"[redacted]")
+                .finish(),
+            Self::DynamicCode { .. } => f
+                .debug_struct("DynamicCode")
+                .field("code", &"[redacted]")
+                .finish(),
+        }
+    }
 }
 
 /// Decode operator-supplied pairing-token input, applying the spec's lenient
@@ -164,14 +183,14 @@ pub fn decode_token(input: &str) -> Result<PairingToken> {
 // Pairing record store
 // =============================================================================
 
-/// A persisted pairing record holding a long-term Sendspin PSK.
+/// A persisted pairing record holding a long-term PSK.
 #[derive(Debug, Clone)]
 pub struct PairingRecord {
     /// The long-term PSK.
     pub psk: Psk,
-    /// The bound server identity for stored-pubkey records; `None` for
-    /// shared-PSK records.
-    pub server_id: Option<String>,
+    /// The server identity the record was established with. After a `psk_id`
+    /// match, the client verifies this equals the connection's `server_id`.
+    pub server_id: String,
     /// True once a server has authenticated a session with this record's PSK.
     pub used: bool,
 }
@@ -193,7 +212,7 @@ impl PairingRecord {
     }
 }
 
-/// Outcome of a store mutation, mirroring the management result codes.
+/// Outcome of a store mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
     /// A PSK with the same psk_id already exists (any category).
@@ -212,11 +231,24 @@ pub enum StoreError {
 /// I/O should be deferred or buffered by the implementation. The library
 /// ships [`MemoryPairingStore`]; applications persist records by providing
 /// their own implementation.
+///
+/// Bounded application-provided stores must hold at least 5 records, and when
+/// `add_record` is called at capacity, evict an existing record (which one is
+/// implementation-defined — e.g. least recently `mark_used` — but never one
+/// backing a currently open connection) rather than failing. An evicted
+/// server's next handshake lands in the Sentinel Fallback and it can offer its
+/// operator re-pairing. The in-memory store shipped here is intentionally
+/// unbounded; applications needing bounded persistence should provide a store
+/// with the required eviction policy.
+///
+/// A record for a server replaces that server's previous record. A PSK ID
+/// collision with a record belonging to another server remains an error.
 pub trait PairingStore: Send + Sync {
     /// All records, in stable order.
     fn records(&self) -> Vec<PairingRecord>;
-    /// Add a record. Fails with `AlreadyExists` when the psk_id collides
-    /// with an existing record, and `StorageExhausted` when full.
+    /// Add or replace a record. Fails with `AlreadyExists` when the psk_id
+    /// collides with an existing record belonging to another server, and with
+    /// `StorageExhausted` when full and no record can be evicted.
     fn add_record(&self, record: PairingRecord) -> std::result::Result<(), StoreError>;
     /// Remove a record by psk_id.
     fn remove_record(&self, psk_id: &str) -> std::result::Result<(), StoreError>;
@@ -252,10 +284,17 @@ impl PairingStore for MemoryPairingStore {
     fn add_record(&self, record: PairingRecord) -> std::result::Result<(), StoreError> {
         let mut records = self.records.lock();
         let psk_id = record.psk_id();
-        if records.iter().any(|r| r.psk_id() == psk_id) {
+        if records
+            .iter()
+            .any(|r| r.psk_id() == psk_id && r.server_id != record.server_id)
+        {
             return Err(StoreError::AlreadyExists);
         }
-        records.push(record);
+        if let Some(index) = records.iter().position(|r| r.server_id == record.server_id) {
+            records[index] = record;
+        } else {
+            records.push(record);
+        }
         Ok(())
     }
 
@@ -278,7 +317,7 @@ impl PairingStore for MemoryPairingStore {
 }
 
 /// Assemble the handshake PSK candidate set from a store plus the fixed
-/// candidates (Sentinel, optional Pairing PSK).
+/// candidates (Sentinel and, for every conforming client, its Pairing PSK).
 pub fn candidates_from(
     store: &Arc<dyn PairingStore>,
     pairing_psk: Option<&Psk>,
@@ -357,20 +396,49 @@ mod tests {
     }
 
     #[test]
-    fn store_enforces_uniqueness_and_removal() {
+    fn decoded_pairing_psk_debug_redacts_secret() {
+        let token = PairingToken::PairingPsk {
+            client_key: [1u8; 32],
+            pairing_psk: [2u8; 32],
+        };
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("2, 2, 2"));
+        assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn store_replaces_same_server_and_rejects_cross_server_psk_collision() {
         let store = MemoryPairingStore::new();
         let record = PairingRecord {
             psk: Psk::new([1u8; 32]),
-            server_id: Some("server-a".to_string()),
+            server_id: "server-a".to_string(),
             used: false,
         };
-        let psk_id = record.psk_id();
         store.add_record(record.clone()).unwrap();
-        assert_eq!(store.add_record(record), Err(StoreError::AlreadyExists));
-        store.mark_used(&psk_id);
+        let replacement = PairingRecord {
+            psk: Psk::new([2u8; 32]),
+            server_id: "server-a".to_string(),
+            used: true,
+        };
+        store.add_record(replacement.clone()).unwrap();
+        assert_eq!(store.records().len(), 1);
+        assert_eq!(store.records()[0].psk_id(), replacement.psk_id());
+        assert_eq!(
+            store.add_record(PairingRecord {
+                psk: Psk::new([2u8; 32]),
+                server_id: "server-b".to_string(),
+                used: false,
+            }),
+            Err(StoreError::AlreadyExists)
+        );
+        let replacement_id = replacement.psk_id();
+        store.mark_used(&replacement_id);
         assert!(store.records()[0].used);
-        store.remove_record(&psk_id).unwrap();
-        assert_eq!(store.remove_record(&psk_id), Err(StoreError::NotFound));
+        store.remove_record(&replacement_id).unwrap();
+        assert_eq!(
+            store.remove_record(&replacement_id),
+            Err(StoreError::NotFound)
+        );
     }
 
     #[test]
@@ -378,7 +446,7 @@ mod tests {
         let store: Arc<dyn PairingStore> =
             Arc::new(MemoryPairingStore::with_records(vec![PairingRecord {
                 psk: Psk::new([1u8; 32]),
-                server_id: None,
+                server_id: "server-a".to_string(),
                 used: false,
             }]));
         let pairing = Psk::new([2u8; 32]);
@@ -388,7 +456,9 @@ mod tests {
         assert_eq!(candidates[1].category, PskCategory::Pairing);
         assert_eq!(
             candidates[2].category,
-            PskCategory::LongTerm { server_id: None }
+            PskCategory::LongTerm {
+                server_id: "server-a".to_string()
+            }
         );
     }
 }

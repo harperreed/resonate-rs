@@ -3,13 +3,13 @@
 
 use crate::error::Error;
 use crate::protocol::client::SessionConfig;
-use crate::protocol::crypto::{CipherSuite, Identity, Psk, PskCandidate};
+use crate::protocol::crypto::{CipherSuite, ClientCredentials, PskCandidate};
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientState, DeviceInfo, PairMethodDescriptor,
-    PairingMethod, PlayerState, PlayerV1Support, SourceV1Support, VisualizerV1Support,
+    ArtworkState, AudioFormatSpec, ClientState, DeviceInfo, PlayerState, PlayerStateCommand,
+    PlayerV1Support, SourceV1Support, SupportedPairMethods, VisualizerState, VisualizerV1Support,
 };
-use crate::protocol::pairing::{candidates_from, MemoryPairingStore, PairingRecord, PairingStore};
+use crate::protocol::pairing::{candidates_from, MemoryPairingStore, PairingStore};
 use crate::protocol::session::HelloTemplate;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
@@ -23,9 +23,8 @@ use typed_builder::TypedBuilder;
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
 pub(crate) struct ProtocolClientBuilderRaw {
-    identity: Option<Arc<Identity>>,
+    credentials: ClientCredentials,
     suite: CipherSuite,
-    pairing_psk: Option<Psk>,
     psk_records: Vec<PskCandidate>,
     pairing_store: Option<Arc<dyn PairingStore>>,
     unpaired_access: bool,
@@ -36,9 +35,11 @@ pub(crate) struct ProtocolClientBuilderRaw {
     mac_address: Option<String>,
     player_v1_support: Option<PlayerV1Support>,
     source_v1_support: Option<SourceV1Support>,
-    artwork_v1_support: Option<ArtworkV1Support>,
+    artwork_state: Option<ArtworkState>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    visualizer_state: Option<VisualizerState>,
     initial_available: bool,
+    max_encoded_artwork_transfer_bytes: usize,
     initial_player_state: Option<PlayerState>,
     metadata: bool,
     controller: bool,
@@ -51,7 +52,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         let mut supported_roles = Vec::new();
         let has_explicit_role = raw.player_v1_support.is_some()
             || raw.source_v1_support.is_some()
-            || raw.artwork_v1_support.is_some()
+            || raw.artwork_state.is_some()
             || raw.visualizer_v1_support.is_some()
             || raw.metadata
             || raw.controller
@@ -83,7 +84,6 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
                     },
                 ],
                 buffer_capacity: 50 * 1024 * 1024,
-                supported_commands: vec!["volume".to_string(), "mute".to_string()],
             })
         };
 
@@ -93,7 +93,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         if raw.source_v1_support.is_some() {
             supported_roles.push("source@v1".to_string());
         }
-        if raw.artwork_v1_support.is_some() {
+        if raw.artwork_state.is_some() {
             supported_roles.push("artwork@v1".to_string());
         }
         if raw.visualizer_v1_support.is_some() {
@@ -110,9 +110,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
 
         ProtocolClientBuilder {
-            identity: raw.identity,
+            credentials: raw.credentials,
             suite: raw.suite,
-            pairing_psk: raw.pairing_psk,
             psk_records: raw.psk_records,
             pairing_store: raw.pairing_store,
             unpaired_access: raw.unpaired_access,
@@ -125,9 +124,11 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             player_v1_support,
             clock: Arc::new(DefaultClock::new()),
             source_v1_support: raw.source_v1_support,
-            artwork_v1_support: raw.artwork_v1_support,
+            artwork_state: raw.artwork_state,
             visualizer_v1_support: raw.visualizer_v1_support,
+            visualizer_state: raw.visualizer_state,
             initial_available: raw.initial_available,
+            max_encoded_artwork_transfer_bytes: raw.max_encoded_artwork_transfer_bytes,
             initial_player_state: raw.initial_player_state,
         }
     }
@@ -139,19 +140,16 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
 pub struct ProtocolClientBuilderFields {
     /// Human-readable client name
     name: String,
-    /// The client's static Curve25519 identity. Persist and reuse the secret
-    /// key across restarts so servers recognize this client; a fresh identity
-    /// is generated when omitted.
-    #[builder(default = None, setter(transform = |x: Identity| Some(Arc::new(x))))]
-    identity: Option<Arc<Identity>>,
+    /// The client's stable identity and mandatory Pairing PSK. Generate this
+    /// once, persist [`ClientCredentials::to_bytes`] in application-owned
+    /// secure storage, and reuse it across restarts. The same value can produce
+    /// the pairing token before the first connection.
+    credentials: ClientCredentials,
     /// The Noise cipher suite announced in `client/init`.
     #[builder(default = CipherSuite::ChaChaPoly)]
     suite: CipherSuite,
-    /// The client's Pairing PSK: offering it advertises the `pairing_psk`
-    /// method and keeps it among the handshake PSK candidates.
-    #[builder(default = None, setter(transform = |x: Psk| Some(x)))]
-    pairing_psk: Option<Psk>,
-    /// Long-term pairing-record PSK candidates (stored-pubkey or shared-PSK).
+    /// Extra long-term pairing-record PSK candidates (each bound to a
+    /// `server_id`), in addition to those loaded from the pairing store.
     #[builder(default = Vec::new())]
     psk_records: Vec<PskCandidate>,
     /// Persistence for pairing records: existing records become handshake
@@ -159,9 +157,9 @@ pub struct ProtocolClientBuilderFields {
     /// in-memory store that does not survive restarts.
     #[builder(default = None, setter(transform = |x: Arc<dyn PairingStore>| Some(x)))]
     pairing_store: Option<Arc<dyn PairingStore>>,
-    /// Whether this client admits unpaired (Sentinel-PSK) playback sessions
-    /// at trust level `none`. Defaults to `true` for frictionless setups;
-    /// products handling sensitive inputs should disable it and pair.
+    /// Whether this client admits unpaired (Sentinel-PSK) playback sessions.
+    /// Defaults to `true` for frictionless setups; products handling
+    /// sensitive inputs (e.g. a microphone source) should disable it and pair.
     #[builder(default = true)]
     unpaired_access: bool,
     #[builder(default = None)]
@@ -176,14 +174,27 @@ pub struct ProtocolClientBuilderFields {
     player_v1_support: Option<PlayerV1Support>,
     #[builder(default = None, setter(transform = |x: SourceV1Support| Some(x)))]
     source_v1_support: Option<SourceV1Support>,
-    #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
-    artwork_v1_support: Option<ArtworkV1Support>,
+    /// Declares the `artwork@v1` role: the per-channel configuration this
+    /// client wants, sent in the initial `client/state` artwork object.
+    #[builder(default = None, setter(transform = |x: ArtworkState| Some(x)))]
+    artwork_state: Option<ArtworkState>,
+    /// Declares the `visualizer@v1` role capability (`buffer_capacity`).
+    /// Requires `visualizer_state` for the initial `client/state`.
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
+    /// The requested visualizer data types, frame-rate cap, and spectrum
+    /// configuration, sent in the initial `client/state` visualizer object.
+    #[builder(default = None, setter(transform = |x: VisualizerState| Some(x)))]
+    visualizer_state: Option<VisualizerState>,
     /// Initial top-level availability sent in the first `client/state`.
     /// `false` when another source owns the output at connect time.
     #[builder(default = true)]
     initial_available: bool,
+    /// Maximum encoded JPEG/PNG bytes accepted in one artwork transfer. This
+    /// is the aggregate artwork announce `total_size`, not pixel dimensions,
+    /// decoded image memory, one message, or transport framing overhead.
+    #[builder(default = crate::protocol::binary::DEFAULT_MAX_ENCODED_ARTWORK_TRANSFER_BYTES)]
+    max_encoded_artwork_transfer_bytes: usize,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     #[builder(default = false, setter(transform = || true))]
@@ -197,9 +208,8 @@ pub struct ProtocolClientBuilderFields {
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
     fn from(fields: ProtocolClientBuilderFields) -> Self {
         let raw = ProtocolClientBuilderRaw {
-            identity: fields.identity,
+            credentials: fields.credentials,
             suite: fields.suite,
-            pairing_psk: fields.pairing_psk,
             psk_records: fields.psk_records,
             pairing_store: fields.pairing_store,
             unpaired_access: fields.unpaired_access,
@@ -210,9 +220,11 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             mac_address: fields.mac_address,
             player_v1_support: fields.player_v1_support,
             source_v1_support: fields.source_v1_support,
-            artwork_v1_support: fields.artwork_v1_support,
+            artwork_state: fields.artwork_state,
             visualizer_v1_support: fields.visualizer_v1_support,
+            visualizer_state: fields.visualizer_state,
             initial_available: fields.initial_available,
+            max_encoded_artwork_transfer_bytes: fields.max_encoded_artwork_transfer_bytes,
             initial_player_state: fields.initial_player_state,
             metadata: fields.metadata,
             controller: fields.controller,
@@ -225,9 +237,8 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
 /// Builder Class for ProtocolClient
 #[derive(Clone)]
 pub struct ProtocolClientBuilder {
-    identity: Option<Arc<Identity>>,
+    credentials: ClientCredentials,
     suite: CipherSuite,
-    pairing_psk: Option<Psk>,
     psk_records: Vec<PskCandidate>,
     pairing_store: Option<Arc<dyn PairingStore>>,
     unpaired_access: bool,
@@ -239,9 +250,11 @@ pub struct ProtocolClientBuilder {
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
     source_v1_support: Option<SourceV1Support>,
-    artwork_v1_support: Option<ArtworkV1Support>,
+    artwork_state: Option<ArtworkState>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    visualizer_state: Option<VisualizerState>,
     initial_available: bool,
+    max_encoded_artwork_transfer_bytes: usize,
     initial_player_state: Option<PlayerState>,
     clock: Arc<dyn Clock>,
 }
@@ -316,50 +329,52 @@ impl ProtocolClientBuilder {
     }
 
     pub(crate) fn into_config(self) -> Result<SessionConfig, Error> {
-        let identity = match self.identity {
-            Some(identity) => identity,
-            None => Arc::new(Identity::generate()?),
-        };
+        let identity = Arc::new(self.credentials.identity().clone());
+        let pairing_psk = self.credentials.pairing_psk().clone();
+
+        if self.max_encoded_artwork_transfer_bytes == 0 {
+            return Err(Error::Protocol(
+                "max_encoded_artwork_transfer_bytes must be greater than zero".to_string(),
+            ));
+        }
 
         let store = self
             .pairing_store
             .unwrap_or_else(|| Arc::new(MemoryPairingStore::new()));
 
-        // Ensure a shared-PSK record exists for `record_mode` (the spec's
-        // pre-provisioned storage-exhaustion fallback; management.md#record-mode).
-        // Done before candidate assembly so the record is a handshake candidate.
-        let record_mode = match store.records().iter().find(|r| r.server_id.is_none()) {
-            Some(shared) => shared.psk_id(),
-            None => {
-                let record = PairingRecord {
-                    psk: Psk::generate()?,
-                    server_id: None,
-                    used: false,
-                };
-                let psk_id = record.psk_id();
-                if let Err(e) = store.add_record(record) {
-                    // Degenerate (e.g. exhausted app store): the id still
-                    // names the intended fallback, but it isn't persisted.
-                    log::error!("Failed to pre-provision shared-PSK record: {e:?}");
-                }
-                psk_id
-            }
-        };
-
-        // Assemble PSK candidates: the Sentinel is always a candidate, the
-        // Pairing PSK when configured, plus stored records and any extras.
-        let mut psk_candidates = candidates_from(&store, self.pairing_psk.as_ref());
-        psk_candidates.extend(self.psk_records);
-        let pairing_psk = self.pairing_psk;
-        let mut supported_pair_methods = Vec::new();
-        if pairing_psk.is_some() {
-            supported_pair_methods.push(PairMethodDescriptor {
-                method: PairingMethod::PairingPsk,
-                out_channels: None,
-                formats: None,
-                locations: None,
-            });
+        // The visualizer role's stream configuration lives in the
+        // `client/state` visualizer object; the server streams nothing until
+        // it has one, so require it up front.
+        if self.visualizer_v1_support.is_some() && self.visualizer_state.is_none() {
+            return Err(Error::Protocol(
+                "visualizer_v1_support requires visualizer_state (types, rate_max)".to_string(),
+            ));
         }
+        if self.visualizer_state.is_some() && self.visualizer_v1_support.is_none() {
+            return Err(Error::Protocol(
+                "visualizer_state requires visualizer_v1_support".to_string(),
+            ));
+        }
+        if let Some(state) = self.visualizer_state.as_ref() {
+            state
+                .validate()
+                .map_err(|m| Error::Protocol(m.to_string()))?;
+        }
+        if let Some(state) = self.artwork_state.as_ref() {
+            state
+                .validate()
+                .map_err(|m| Error::Protocol(m.to_string()))?;
+        }
+
+        // Assemble PSK candidates: the Sentinel, mandatory Pairing PSK, stored
+        // records, and any explicitly supplied extras.
+        let mut psk_candidates = candidates_from(&store, Some(&pairing_psk));
+        psk_candidates.extend(self.psk_records);
+        let supported_pair_methods = SupportedPairMethods {
+            pairing_psk: Some(Default::default()),
+            static_pairing_code: None,
+            dynamic_pairing_code: None,
+        };
 
         let hello = HelloTemplate {
             name: self.name,
@@ -370,17 +385,54 @@ impl ProtocolClientBuilder {
                 mac_address: self.mac_address,
             }),
             supported_roles: self.supported_roles,
-            player_v1_support: self.player_v1_support,
+            player_v1_support: self.player_v1_support.clone(),
             source_v1_support: self.source_v1_support,
-            artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
             supported_pair_methods,
         };
 
+        // A player client must include the player object in its initial
+        // client/state (the server sends no audio or commands before it):
+        // seed a settable-volume/mute default when none was provided.
+        let player_state = self.initial_player_state.or_else(|| {
+            self.player_v1_support.is_some().then(|| PlayerState {
+                volume: Some(100),
+                muted: Some(false),
+                output_delay_ms: 0,
+                required_lead_time_ms: 0,
+                min_buffer_ms: 0,
+                supported_commands: vec![PlayerStateCommand::Volume, PlayerStateCommand::Mute],
+                format: None,
+            })
+        });
+        if player_state.is_some() && self.player_v1_support.is_none() {
+            return Err(Error::Protocol(
+                "initial_player_state requires player_v1_support".to_string(),
+            ));
+        }
+        if let Some(state) = player_state.as_ref() {
+            state
+                .validate()
+                .map_err(|message| Error::Protocol(message.to_string()))?;
+            if let Some(format) = state.format.as_ref() {
+                let supported = self
+                    .player_v1_support
+                    .as_ref()
+                    .is_some_and(|support| support.supported_formats.contains(format));
+                if !supported {
+                    return Err(Error::Protocol(
+                        "initial player format is not in supported_formats".to_string(),
+                    ));
+                }
+            }
+        }
+
         let initial_state = ClientState {
             available: self.initial_available,
-            player: self.initial_player_state,
+            player: player_state,
             source: None,
+            artwork: self.artwork_state,
+            visualizer: self.visualizer_state,
         };
 
         Ok(SessionConfig {
@@ -388,11 +440,10 @@ impl ProtocolClientBuilder {
             suite: self.suite,
             psk_candidates,
             store,
-            pairing_psk,
             unpaired_access: self.unpaired_access,
-            record_mode,
             hello,
             initial_state,
+            max_encoded_artwork_transfer_bytes: self.max_encoded_artwork_transfer_bytes,
             clock: self.clock,
         })
     }

@@ -6,7 +6,7 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{Message, PlaybackState};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 
 /// Sendspin metadata client using the managed inbound listener
 #[derive(Parser, Debug)]
@@ -26,7 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args = Args::parse();
+    // Persist credentials.to_bytes() in application-owned secure storage and
+    // restore them with ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
     let listener = ProtocolClientBuilder::builder()
+        .credentials(credentials)
         .name(args.name.clone())
         .metadata()
         .build()
@@ -64,8 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let peer = conn.peer;
         let server_id = conn.session.server_id.clone();
         println!(
-            "[{peer}] now serving server_id={server_id} trust_level={:?} activities={:?}",
-            conn.session.trust_level, conn.session.initial_activities
+            "[{peer}] now serving server_id={server_id} paired={} activities={:?}",
+            conn.session.paired, conn.session.initial_activities
         );
 
         // Only `messages` is consumed: this client negotiates just the
@@ -73,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // silent and can be ignored. A player would drain those too.
         while let Some(msg) = conn.messages.recv().await {
             match msg {
-                Message::GroupUpdate(g) if g.playback_state == Some(PlaybackState::Playing) => {
+                Message::GroupUpdate(g) if g.playback_state == PlaybackState::Playing => {
                     // Feed the policy input back so a returning server wins
                     // discovery ties. A spec-compliant client would also
                     // persist this to disk here.

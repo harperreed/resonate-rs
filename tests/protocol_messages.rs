@@ -48,6 +48,7 @@ fn cleartext_and_noise_handshake_round_trip() {
 fn server_hello_and_client_hello_wire_shapes() {
     let server = Message::ServerHello(ServerHello {
         name: "Living Room".into(),
+        languages: Some(vec!["en-US".into()]),
     });
     assert_eq!(
         payload(serde_json::to_value(server).unwrap())["name"],
@@ -60,28 +61,26 @@ fn server_hello_and_client_hello_wire_shapes() {
             product_name: Some("Player".into()),
             ..Default::default()
         }),
-        trust_level: TrustLevel::User,
-        supported_roles: vec!["player@v1".into(), "artwork@v1".into()],
+        supported_roles: vec!["player@v1".into(), "visualizer@v1".into()],
         player_v1_support: None,
         source_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-        supported_pair_methods: vec![PairMethodDescriptor {
-            method: PairingMethod::DynamicPairingCode,
-            out_channels: Some(vec![PairingOutChannel::Display, PairingOutChannel::Speaker]),
-            formats: Some(vec![PairingCodeFormat::Digits, PairingCodeFormat::QrCode]),
-            locations: Some(vec![PairingSecretLocation::Operator]),
-        }],
+        visualizer_v1_support: Some(VisualizerV1Support {
+            buffer_capacity: 4096,
+        }),
+        supported_pair_methods: SupportedPairMethods {
+            dynamic_pairing_code: Some(DynamicPairingCodeDescriptor {
+                out_channels: vec![PairingOutChannel::Display, PairingOutChannel::Speaker],
+                formats: vec![PairingCodeFormat::Digits, PairingCodeFormat::QrCode],
+                digit_audio: None,
+            }),
+            ..Default::default()
+        },
         unpaired_access: UnpairedAccess { enabled: false },
     };
     let value = serde_json::to_value(&hello).unwrap();
-    assert_eq!(value["trust_level"], "user");
+    assert!(value.get("trust_level").is_none());
     assert_eq!(
-        value["supported_pair_methods"][0]["method"],
-        "dynamic_pairing_code"
-    );
-    assert_eq!(
-        value["supported_pair_methods"][0]["out_channels"],
+        value["supported_pair_methods"]["dynamic_pairing_code"]["out_channels"],
         serde_json::json!(["display", "speaker"])
     );
     assert_eq!(value["unpaired_access"]["enabled"], false);
@@ -92,48 +91,32 @@ fn server_hello_and_client_hello_wire_shapes() {
 #[test]
 fn server_activate_and_capability_enum_values() {
     let activate = Message::ServerActivate(ServerActivate {
-        activities: vec![Activity::Playback, Activity::Pairing, Activity::Management],
+        activities: vec![Activity::Playback, Activity::Pairing],
         active_roles: Some(vec!["player@v1".into()]),
         pairing: Some(ActivatePairing {
             method: PairingMethod::StaticPairingCode,
             format: Some(PairingCodeFormat::Digits),
-            languages: Some(vec!["en-US".into()]),
         }),
     });
     let value = serde_json::to_value(activate).unwrap();
     assert_eq!(value["type"], "server/activate");
     assert_eq!(
         value["payload"]["activities"],
-        serde_json::json!(["playback", "pairing", "management"])
+        serde_json::json!(["playback", "pairing"])
     );
     assert_eq!(value["payload"]["pairing"]["method"], "static_pairing_code");
 
-    let artwork = ArtworkV1Support {
-        channels: vec![
-            ArtworkChannel {
-                source: ArtworkSource::Album,
-                format: ImageFormat::Jpeg,
-                media_width: 800,
-                media_height: 600,
-            },
-            ArtworkChannel {
-                source: ArtworkSource::Artist,
-                format: ImageFormat::Png,
-                media_width: 400,
-                media_height: 400,
-            },
-            ArtworkChannel {
-                source: ArtworkSource::None,
-                format: ImageFormat::Bmp,
-                media_width: 1,
-                media_height: 1,
-            },
-        ],
+    let artwork = ArtworkState {
+        channels: vec![ArtworkChannelConfig {
+            source: ArtworkSource::Album,
+            format: Some(ImageFormat::Jpeg),
+            width: Some(800),
+            height: Some(600),
+        }],
     };
     let value = serde_json::to_value(artwork).unwrap();
     assert_eq!(value["channels"][0]["source"], "album");
-    assert_eq!(value["channels"][1]["format"], "png");
-    assert_eq!(value["channels"][2]["format"], "bmp");
+    assert_eq!(value["channels"][0]["format"], "jpeg");
 }
 
 #[test]
@@ -169,11 +152,13 @@ fn state_optional_fields_and_null_clears_are_distinct() {
         player: Some(PlayerState {
             volume: Some(100),
             muted: Some(false),
-            output_delay_ms: Some(25),
-            supported_commands: Some(vec![PlayerStateCommand::SetOutputDelay]),
+            output_delay_ms: 25,
+            supported_commands: vec![PlayerStateCommand::SetOutputDelay],
             ..Default::default()
         }),
         source: None,
+        artwork: None,
+        visualizer: None,
     };
     let value = serde_json::to_value(&state).unwrap();
     assert_eq!(value["available"], true);
@@ -181,7 +166,8 @@ fn state_optional_fields_and_null_clears_are_distinct() {
         value["player"]["supported_commands"],
         serde_json::json!(["set_output_delay"])
     );
-    assert!(value["player"].get("required_lead_time_ms").is_none());
+    assert_eq!(value["player"]["required_lead_time_ms"], 0);
+    assert_eq!(value["player"]["min_buffer_ms"], 0);
     let decoded: ClientState = serde_json::from_value(value).unwrap();
     assert_eq!(decoded.player.unwrap().volume, Some(100));
 
@@ -236,17 +222,17 @@ fn metadata_controller_repeat_and_playback_values() {
         supported_commands: vec!["seek".into()],
         volume: 75,
         muted: false,
-        repeat: Some(RepeatMode::One),
-        shuffle: Some(false),
+        repeat: RepeatMode::One,
+        shuffle: false,
         seek_max_ms: Some(9000),
     };
     let value = serde_json::to_value(controller).unwrap();
     assert_eq!(value["repeat"], "one");
     assert_eq!(value["seek_max_ms"], 9000);
     let group = GroupUpdate {
-        playback_state: Some(PlaybackState::Playing),
-        group_id: Some("g1".into()),
-        group_name: Some("Group".into()),
+        playback_state: PlaybackState::Playing,
+        group_id: "g1".into(),
+        group_name: "Group".into(),
     };
     assert_eq!(
         serde_json::to_value(group).unwrap()["playback_state"],
@@ -332,11 +318,11 @@ fn stream_start_end_clear_and_source_stream_shapes() {
             codec_header: Some("header".into()),
         }),
         artwork: Some(StreamArtworkConfig {
-            channels: vec![StreamArtworkChannelConfig {
+            channels: vec![ArtworkChannelConfig {
                 source: ArtworkSource::Album,
-                format: ImageFormat::Png,
-                width: 320,
-                height: 240,
+                format: Some(ImageFormat::Png),
+                width: Some(320),
+                height: Some(240),
             }],
         }),
         visualizer: None,
@@ -346,7 +332,6 @@ fn stream_start_end_clear_and_source_stream_shapes() {
     assert_eq!(value["payload"]["player"]["sample_rate"], 48000);
     assert_eq!(value["payload"]["artwork"]["channels"][0]["format"], "png");
     let end = serde_json::to_value(Message::StreamEnd(StreamEnd {
-        server_transmitted: 11,
         roles: Some(vec!["player@v1".into()]),
     }))
     .unwrap();
@@ -370,93 +355,43 @@ fn stream_start_end_clear_and_source_stream_shapes() {
     };
     assert_eq!(
         serde_json::to_value(Message::ClientStreamStart(source)).unwrap()["type"],
-        "client_stream/start"
+        "client-stream/start"
     );
     assert_eq!(
         serde_json::to_value(Message::ClientStreamEnd(ClientStreamEnd {})).unwrap(),
-        serde_json::json!({"type":"client_stream/end", "payload":{}})
+        serde_json::json!({"type":"client-stream/end", "payload":{}})
     );
 }
 
 #[test]
-fn stream_request_format_and_artwork_variants() {
-    let request = StreamRequestFormat {
-        player: Some(PlayerFormatRequest {
-            codec: Some("pcm".into()),
-            channels: Some(2),
-            sample_rate: Some(48000),
-            bit_depth: Some(24),
-        }),
-        artwork: Some(ArtworkFormatRequest {
-            channel: 0,
-            source: Some(ArtworkSource::Artist),
-            format: Some(ImageFormat::Jpeg),
-            media_width: Some(800),
-            media_height: Some(800),
-        }),
-        visualizer: Some(VisualizerFormatRequest {
-            types: Some(vec![VisualizerDataType::Spectrum]),
-            rate_max: Some(30),
-            spectrum: None,
-        }),
-    };
-    let value = serde_json::to_value(Message::StreamRequestFormat(request)).unwrap();
-    assert_eq!(value["type"], "stream/request-format");
-    assert_eq!(value["payload"]["artwork"]["source"], "artist");
-    assert_eq!(value["payload"]["artwork"]["format"], "jpeg");
-    assert_eq!(
-        value["payload"]["visualizer"]["types"],
-        serde_json::json!(["spectrum"])
-    );
-    assert!(value["payload"]["player"].get("missing").is_none());
-}
-
-#[test]
-fn visualizer_validators_pin_cross_field_rules() {
+fn state_visualizer_validator_pins_spectrum_cross_field_rule() {
     let config = SpectrumConfig {
         n_disp_bins: 32,
         scale: SpectrumScale::Log,
         f_min: 20,
         f_max: 20000,
     };
-    assert!(VisualizerV1Support {
+    assert!(VisualizerState {
         types: vec![VisualizerDataType::Spectrum],
-        buffer_capacity: 1,
         rate_max: 30,
-        spectrum: Some(config.clone())
+        spectrum: Some(config.clone()),
     }
     .validate()
     .is_ok());
-    assert!(VisualizerV1Support {
+    assert!(VisualizerState {
         types: vec![VisualizerDataType::Spectrum],
-        buffer_capacity: 1,
         rate_max: 30,
-        spectrum: None
+        spectrum: None,
     }
     .validate()
     .is_err());
-    assert!(VisualizerV1Support {
+    assert!(VisualizerState {
         types: vec![VisualizerDataType::Loudness],
-        buffer_capacity: 1,
         rate_max: 30,
-        spectrum: Some(config.clone())
+        spectrum: Some(config),
     }
     .validate()
     .is_err());
-    assert!(VisualizerFormatRequest {
-        types: None,
-        rate_max: None,
-        spectrum: None
-    }
-    .validate()
-    .is_err());
-    assert!(VisualizerFormatRequest {
-        types: Some(vec![VisualizerDataType::Loudness]),
-        rate_max: None,
-        spectrum: None
-    }
-    .validate()
-    .is_ok());
 }
 
 #[test]
@@ -546,86 +481,16 @@ fn pair_messages_pin_wire_names_and_round_trip() {
 }
 
 #[test]
-fn management_messages_and_result_codes_serialize() {
-    assert_eq!(
-        serde_json::to_value(Message::ManagementListRecords(ManagementListRecords {})).unwrap(),
-        serde_json::json!({"type":"management/list-records", "payload":{}})
+fn required_group_update_fields_are_required_on_wire() {
+    assert!(serde_json::from_str::<GroupUpdate>(r#"{"group_id":"g","group_name":"G"}"#).is_err());
+    assert!(serde_json::from_str::<GroupUpdate>(
+        r#"{"playback_state":"playing","group_name":"G"}"#
+    )
+    .is_err());
+    assert!(
+        serde_json::from_str::<GroupUpdate>(r#"{"playback_state":"playing","group_id":"g"}"#)
+            .is_err()
     );
-    let add = Message::ManagementAddRecord(ManagementAddRecord {
-        psk: "psk".into(),
-        server_id: None,
-    });
-    let value = serde_json::to_value(add).unwrap();
-    assert_eq!(value["type"], "management/add-record");
-    assert!(value["payload"].get("server_id").is_none());
-    let remove = Message::ManagementRemoveRecord(ManagementRemoveRecord {
-        psk_id: "id".into(),
-    });
-    assert_eq!(
-        serde_json::to_value(remove).unwrap()["payload"]["psk_id"],
-        "id"
-    );
-    assert_eq!(
-        serde_json::to_value(Message::ManagementGetPairingConfig(
-            ManagementGetPairingConfig {}
-        ))
-        .unwrap()["type"],
-        "management/get-pairing-config"
-    );
-    assert_eq!(
-        serde_json::to_value(Message::ManagementOpenPairingWindow(
-            ManagementOpenPairingWindow {}
-        ))
-        .unwrap()["type"],
-        "management/open-pairing-window"
-    );
-
-    let set = ManagementSetPairingConfig {
-        pairing_psk: Some(PairingPskConfigPatch {
-            enabled: Some(true),
-            psk: Some("new".into()),
-        }),
-        static_pairing_code: Some(StaticPairingCodeConfigPatch {
-            enabled: Some(false),
-            code: Some("12345678".into()),
-        }),
-        dynamic_pairing_code: Some(DynamicPairingCodeConfigPatch {
-            enabled: Some(true),
-        }),
-        record_mode: Some(RecordMode {
-            psk_id: "fallback".into(),
-        }),
-        unpaired_access: Some(UnpairedAccessPatch {
-            enabled: Some(false),
-        }),
-    };
-    let value = serde_json::to_value(Message::ManagementSetPairingConfig(set)).unwrap();
-    assert_eq!(value["type"], "management/set-pairing-config");
-    assert_eq!(value["payload"]["static_pairing_code"]["code"], "12345678");
-
-    let result = ManagementResult {
-        result: ManagementResultCode::NotFound,
-        data: Some(serde_json::json!({"id":"missing"})),
-        storage: Some(StorageAccounting {
-            free: 10,
-            capacity: Some(100),
-            cost_individual: None,
-            cost_shared: Some(5),
-        }),
-    };
-    let value = serde_json::to_value(Message::ManagementResult(result)).unwrap();
-    assert_eq!(value["payload"]["result"], "not_found");
-    assert_eq!(value["payload"]["storage"]["cost_shared"], 5);
-    assert!(value["payload"]["storage"].get("cost_individual").is_none());
-    for (code, expected) in [
-        (ManagementResultCode::Ok, "ok"),
-        (ManagementResultCode::PermissionDenied, "permission_denied"),
-        (ManagementResultCode::AlreadyExists, "already_exists"),
-        (ManagementResultCode::Invalid, "invalid"),
-        (ManagementResultCode::StorageExhausted, "storage_exhausted"),
-    ] {
-        assert_eq!(serde_json::to_value(code).unwrap(), expected);
-    }
 }
 
 #[test]

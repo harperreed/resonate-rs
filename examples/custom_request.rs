@@ -1,10 +1,12 @@
 // ABOUTME: Example demonstrating builder capabilities with a custom WebSocket request
-// ABOUTME: Shows auth-proxy headers, persisted identity, player format config, and controller role
+// ABOUTME: Shows auth-proxy headers, persisted credentials, player format config, and controller role
 // Run with: cargo run --example custom_request
 
 use clap::Parser;
-use sendspin::protocol::messages::{AudioFormatSpec, PlayerState, PlayerV1Support};
-use sendspin::{Identity, ProtocolClientBuilder};
+use sendspin::protocol::messages::{
+    AudioFormatSpec, PlayerState, PlayerStateCommand, PlayerV1Support,
+};
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Sendspin advanced client
@@ -40,14 +42,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .headers_mut()
         .insert("cookie", "ingress_session=<session_token>".parse()?);
 
-    // A real client persists its identity's secret key so servers recognize
-    // it across restarts; a fresh identity is generated here for brevity.
-    let identity = Identity::generate()?;
+    // Persist credentials.to_bytes() in application-owned secure storage so
+    // servers recognize this client across restarts. Restore with
+    // ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
 
     // Configure the builder with explicit player support and controller role
     let client = ProtocolClientBuilder::builder()
         .name(args.name)
-        .identity(identity)
+        .credentials(credentials)
         .product_name(Some("Sendspin-RS Advanced Client".to_string()))
         .software_version(Some(env!("CARGO_PKG_VERSION").to_string()))
         // Declare player capabilities: 24-bit/48kHz stereo PCM
@@ -59,7 +62,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bit_depth: 24,
             }],
             buffer_capacity: 50 * 1024 * 1024,
-            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         })
         // Request controller role for playback control
         .controller()
@@ -67,10 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .initial_player_state(PlayerState {
             volume: Some(80),
             muted: Some(false),
-            output_delay_ms: Some(0),
-            required_lead_time_ms: Some(500),
-            min_buffer_ms: Some(500),
-            ..Default::default()
+            output_delay_ms: 0,
+            required_lead_time_ms: 500,
+            min_buffer_ms: 500,
+            supported_commands: vec![PlayerStateCommand::Volume, PlayerStateCommand::Mute],
+            format: None,
         })
         .build()
         .connect(request)
