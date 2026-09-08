@@ -21,8 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Connecting to {}...", args.server);
-    // Persist credentials.to_bytes() in application-owned secure storage and
-    // restore them with ClientCredentials::from_bytes() on the next launch.
+    // This example generates fresh credentials on every run. A real
+    // application should persist credentials.to_bytes() in application-owned
+    // secure storage and restore them with ClientCredentials::from_bytes() on
+    // the next launch.
     let credentials = ClientCredentials::generate()?;
     let test = ProtocolClientBuilder::builder()
         .credentials(credentials)

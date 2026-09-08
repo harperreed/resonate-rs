@@ -1,7 +1,7 @@
 mod common;
 
 use common::{test_credentials, MockServer};
-use sendspin::protocol::messages::{Activity, ClientCommand, Message};
+use sendspin::protocol::messages::Activity;
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -148,9 +148,7 @@ async fn sends_fail_after_server_disconnects() {
     .expect("client did not observe server disconnect");
     let send = timeout(
         Duration::from_secs(3),
-        connection
-            .sender
-            .send_message(Message::ClientCommand(ClientCommand { controller: None })),
+        connection.sender.send_available(true),
     )
     .await
     .expect("send remained pending after server disconnect");

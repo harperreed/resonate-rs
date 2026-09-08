@@ -6,8 +6,8 @@ use sendspin::protocol::crypto::{
     Psk,
 };
 use sendspin::protocol::messages::{
-    Activity, ClientHello, ClientInit, ClientTime, Message, NoiseHandshake, ServerActivate,
-    ServerHello, ServerInit, ServerTime,
+    ActivatePairing, Activity, ClientHello, ClientInit, ClientTime, Message, NoiseHandshake,
+    ServerActivate, ServerHello, ServerInit, ServerTime,
 };
 use sendspin::protocol::transport::frame_type;
 use std::error::Error;
@@ -55,6 +55,42 @@ impl MockServer {
         Self::handshake(ws, name, activities, active_roles).await
     }
 
+    /// Accept a connection while selecting the initial activation's pairing
+    /// object. This is used to exercise handshake admission failures.
+    pub async fn accept_with_pairing(
+        listener: TcpListener,
+        name: &str,
+        activities: Vec<Activity>,
+        active_roles: Vec<String>,
+        pairing: Option<ActivatePairing>,
+    ) -> Result<Self, BoxError> {
+        let (stream, _) = listener.accept().await?;
+        let ws = accept_async(stream).await?;
+        Self::handshake_with_options(ws, name, activities, active_roles, pairing, None).await
+    }
+
+    /// Accept a connection authenticated by a supplied long-term PSK.
+    pub async fn accept_with_long_term_psk(
+        listener: TcpListener,
+        name: &str,
+        activities: Vec<Activity>,
+        active_roles: Vec<String>,
+        server_identity: Identity,
+        psk: Psk,
+    ) -> Result<Self, BoxError> {
+        let (stream, _) = listener.accept().await?;
+        let ws = accept_async(stream).await?;
+        Self::handshake_with_options(
+            ws,
+            name,
+            activities,
+            active_roles,
+            None,
+            Some((server_identity, psk)),
+        )
+        .await
+    }
+
     /// Dial a client listener and complete the server side of the protocol.
     pub async fn dial(
         addr: SocketAddr,
@@ -97,10 +133,24 @@ impl MockServer {
     }
 
     async fn handshake<S>(
+        ws: Ws<S>,
+        name: &str,
+        activities: Vec<Activity>,
+        active_roles: Vec<String>,
+    ) -> Result<Self, BoxError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::handshake_with_options(ws, name, activities, active_roles, None, None).await
+    }
+
+    async fn handshake_with_options<S>(
         mut ws: Ws<S>,
         name: &str,
         activities: Vec<Activity>,
         active_roles: Vec<String>,
+        pairing: Option<ActivatePairing>,
+        long_term: Option<(Identity, Psk)>,
     ) -> Result<Self, BoxError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -116,7 +166,9 @@ impl MockServer {
         };
         let suite = CipherSuite::from_wire_name(&suite_name)?;
         let client_public = b64url_decode_32(&client_id)?;
-        let server_identity = Identity::generate()?;
+        let (server_identity, handshake_psk, handshake_category) = long_term
+            .map(|(identity, psk)| (identity, psk, "lt"))
+            .unwrap_or((Identity::generate()?, Psk::sentinel(), "sn"));
         let server_init_wire = serde_json::to_string(&Message::ServerInit(ServerInit {
             server_id: server_identity.id(),
             version: 1,
@@ -130,14 +182,15 @@ impl MockServer {
             suite,
             &server_identity,
             &client_public,
-            &Psk::sentinel(),
+            &handshake_psk,
             &prologue,
         )?;
         let mut buf = vec![0u8; 65535];
         let msg1_len = handshake.write_message(
             format!(
-                r#"{{"psk_id":"{}","psk_category":"sn"}}"#,
-                Psk::sentinel().psk_id()
+                r#"{{"psk_id":"{}","psk_category":"{}"}}"#,
+                handshake_psk.psk_id(),
+                handshake_category
             )
             .as_bytes(),
             &mut buf,
@@ -194,7 +247,7 @@ impl MockServer {
         let activate = Message::ServerActivate(ServerActivate {
             activities,
             active_roles: Some(active_roles),
-            pairing: None,
+            pairing,
         });
         let json = serde_json::to_vec(&activate)?;
         let mut plain = Vec::with_capacity(json.len() + 1);

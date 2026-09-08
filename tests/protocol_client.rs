@@ -2,15 +2,27 @@ mod common;
 
 use common::{test_credentials, MockServer};
 use sendspin::error::Error;
+use sendspin::protocol::crypto::{Identity, Psk};
 use sendspin::protocol::messages::{
-    Activity, ArtworkChannelConfig, ArtworkSource, ArtworkState, AudioFormatSpec, ClientGoodbye,
-    ClientState, ControllerCommandType, GoodbyeReason, GroupUpdate, ImageFormat, Message,
-    PlaybackState, PlayerState, PlayerV1Support, RepeatMode, ServerActivate, VisualizerDataType,
+    ActivatePairing, Activity, ArtworkChannelConfig, ArtworkSource, ArtworkState, AudioFormatSpec,
+    ClientGoodbye, ClientState, ControllerCommandType, GoodbyeReason, GroupUpdate, ImageFormat,
+    Message, PairAbortReason, PairingMethod, PlaybackState, PlayerState, PlayerV1Support,
+    RepeatMode, ServerActivate, ServerUnpair, SourceSignal, SourceState, VisualizerDataType,
     VisualizerState,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
+
+fn source_stream_config() -> sendspin::protocol::messages::SourceStreamConfig {
+    sendspin::protocol::messages::SourceStreamConfig {
+        codec: "pcm".into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth: 16,
+        codec_header: None,
+    }
+}
 
 async fn connected(
     builder: sendspin::ProtocolClientBuilder,
@@ -32,6 +44,43 @@ async fn next_server_message(server: &mut MockServer) -> Message {
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn initial_pairing_method_mismatch_sends_abort_without_finalize() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        common::MockServer::accept_with_pairing(
+            listener,
+            "Pairing Server",
+            vec![Activity::Pairing],
+            vec![],
+            Some(ActivatePairing {
+                method: PairingMethod::StaticPairingCode,
+                format: None,
+            }),
+        )
+        .await
+    });
+    let client = ProtocolClientBuilder::builder()
+        .credentials(test_credentials())
+        .name("Pairing Client".into())
+        .build()
+        .connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    let mut server = server_task.await.unwrap().unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::PairAbort(sendspin::protocol::messages::PairAbort {
+            reason: PairAbortReason::MethodNotSupported
+        })
+    ));
+    assert!(timeout(Duration::from_millis(100), server.recv_json())
+        .await
+        .is_err());
+    drop(client);
 }
 
 #[tokio::test]
@@ -128,6 +177,39 @@ async fn initial_source_state_waits_for_clock_sync() {
         synced.is_ok(),
         "available=true was not sent after clock sync"
     );
+    drop(connection);
+}
+
+#[tokio::test]
+async fn source_state_updates_are_full_state_messages() {
+    let (connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Source state".into())
+            .source_v1_support(Default::default())
+            .initial_available(false)
+            .build(),
+        vec!["source@v1"],
+    )
+    .await;
+    let _ = next_server_message(&mut server).await;
+    connection
+        .sender
+        .update_source_state(SourceState {
+            signal: Some(SourceSignal::Present),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientState(ClientState {
+            available: false,
+            source: Some(SourceState {
+                signal: Some(SourceSignal::Present)
+            }),
+            ..
+        })
+    ));
     drop(connection);
 }
 
@@ -295,6 +377,146 @@ async fn invalid_runtime_player_state_is_rejected_without_sending() {
     assert!(timeout(Duration::from_millis(50), server.recv_json())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn source_end_stream_is_allowed_after_role_removal() {
+    let (mut connection, mut server) = connected(
+        ProtocolClientBuilder::builder()
+            .credentials(test_credentials())
+            .name("Source cleanup".into())
+            .source_v1_support(Default::default())
+            .initial_available(false)
+            .build(),
+        vec!["source@v1"],
+    )
+    .await;
+    let _ = next_server_message(&mut server).await;
+    let source = connection.source.as_ref().unwrap();
+    source.start_stream(source_stream_config()).await.unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientStreamStart(_)
+    ));
+    source.send_chunk(123, &[1, 2, 3]).await.unwrap();
+    source.end_stream().await.unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientStreamEnd(_)
+    ));
+    server
+        .send_json(Message::ServerActivate(ServerActivate {
+            activities: vec![Activity::Playback],
+            active_roles: Some(Vec::new()),
+            pairing: None,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), connection.messages.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::ServerActivate(_)
+    ));
+    assert!(matches!(
+        source.start_stream(source_stream_config()).await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        source.send_chunk(456, &[4, 5, 6]).await,
+        Err(Error::Protocol(_))
+    ));
+    source.end_stream().await.unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientStreamEnd(_)
+    ));
+    server
+        .send_json(Message::ServerActivate(ServerActivate {
+            activities: vec![Activity::Playback],
+            active_roles: Some(Vec::new()),
+            pairing: None,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), connection.messages.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::ServerActivate(_)
+    ));
+    assert!(matches!(
+        source.start_stream(source_stream_config()).await,
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        source.send_chunk(456, &[4, 5, 6]).await,
+        Err(Error::Protocol(_))
+    ));
+    source.end_stream().await.unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientStreamEnd(_)
+    ));
+    drop(connection);
+}
+
+#[tokio::test]
+async fn server_unpair_sends_unpaired_goodbye_for_paired_session() {
+    let pairing_psk = Psk::new([7u8; 32]);
+    let server_identity = Identity::generate().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn({
+        let server_identity = server_identity.clone();
+        let pairing_psk = pairing_psk.clone();
+        async move {
+            common::MockServer::accept_with_long_term_psk(
+                listener,
+                "Paired Server",
+                vec![Activity::Playback],
+                vec!["player@v1".into()],
+                server_identity,
+                pairing_psk,
+            )
+            .await
+        }
+    });
+    let store = std::sync::Arc::new(
+        sendspin::protocol::pairing::MemoryPairingStore::with_records(vec![
+            sendspin::protocol::pairing::PairingRecord {
+                psk: pairing_psk,
+                server_id: server_identity.id(),
+                used: false,
+            },
+        ]),
+    );
+    let client = ProtocolClientBuilder::builder()
+        .credentials(test_credentials())
+        .name("Paired Client".into())
+        .pairing_store(store)
+        .build()
+        .connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    let mut server = server_task.await.unwrap().unwrap();
+    let _ = next_server_message(&mut server).await;
+    server
+        .send_json(Message::ServerUnpair(ServerUnpair {}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_server_message(&mut server).await,
+        Message::ClientGoodbye(ClientGoodbye {
+            reason: GoodbyeReason::Unpaired
+        })
+    ));
+    assert!(timeout(Duration::from_secs(2), server.recv_closed())
+        .await
+        .unwrap());
+    drop(client);
 }
 
 #[tokio::test]

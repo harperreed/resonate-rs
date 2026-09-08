@@ -13,11 +13,9 @@
 //! 24-byte dynamic pairing code (QR emission; not yet implemented here).
 //!
 //! The **pairing record store** persists long-term PSKs established by
-//! pairing, each bound to the `server_id` it was established with. A client
-//! must be able to store at least 5 records; when a pairing completes at
-//! capacity the client evicts an existing record (implementation-defined,
-//! but never one backing a currently open connection) so the new record
-//! persists — a pairing never fails for lack of record storage.
+//! pairing, each bound to the `server_id` it was established with. The store
+//! interface intentionally leaves capacity, eviction, and coordination with
+//! open connections to the application or a higher-level connection manager.
 
 use crate::error::Error;
 use crate::protocol::crypto::{b64url_encode, Identity, Psk, PskCandidate, PskCategory};
@@ -232,14 +230,11 @@ pub enum StoreError {
 /// ships [`MemoryPairingStore`]; applications persist records by providing
 /// their own implementation.
 ///
-/// Bounded application-provided stores must hold at least 5 records, and when
-/// `add_record` is called at capacity, evict an existing record (which one is
-/// implementation-defined — e.g. least recently `mark_used` — but never one
-/// backing a currently open connection) rather than failing. An evicted
-/// server's next handshake lands in the Sentinel Fallback and it can offer its
-/// operator re-pairing. The in-memory store shipped here is intentionally
-/// unbounded; applications needing bounded persistence should provide a store
-/// with the required eviction policy.
+/// The in-memory store shipped here is intentionally unbounded. Applications
+/// may provide a bounded or durable implementation, but the store interface
+/// does not coordinate connection lifetimes, reserve capacity for provisional
+/// pairing sessions, or limit concurrent connections. Those policies belong to
+/// the application or to a higher-level connection manager.
 ///
 /// A record for a server replaces that server's previous record. A PSK ID
 /// collision with a record belonging to another server remains an error.

@@ -42,9 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .headers_mut()
         .insert("cookie", "ingress_session=<session_token>".parse()?);
 
-    // Persist credentials.to_bytes() in application-owned secure storage so
-    // servers recognize this client across restarts. Restore with
-    // ClientCredentials::from_bytes() on the next launch.
+    // This example generates fresh credentials on every run. A real
+    // application should persist credentials.to_bytes() in application-owned
+    // secure storage so servers recognize this client across restarts, then
+    // restore with ClientCredentials::from_bytes() on the next launch.
     let credentials = ClientCredentials::generate()?;
 
     // Configure the builder with explicit player support and controller role

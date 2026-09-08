@@ -113,7 +113,13 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             credentials: raw.credentials,
             suite: raw.suite,
             psk_records: raw.psk_records,
-            pairing_store: raw.pairing_store,
+            // Resolve the default once, when this builder is finalized. The
+            // resulting Arc is cloned by listeners for every accepted peer,
+            // preserving pairing records across reconnects.
+            pairing_store: Some(
+                raw.pairing_store
+                    .unwrap_or_else(|| Arc::new(MemoryPairingStore::new())),
+            ),
             unpaired_access: raw.unpaired_access,
             name: raw.name,
             product_name: raw.product_name,
@@ -153,8 +159,10 @@ pub struct ProtocolClientBuilderFields {
     #[builder(default = Vec::new())]
     psk_records: Vec<PskCandidate>,
     /// Persistence for pairing records: existing records become handshake
-    /// candidates and newly paired records are written here. Defaults to an
-    /// in-memory store that does not survive restarts.
+    /// candidates and newly paired records are written here. When omitted,
+    /// the builder creates one shared in-memory store; listener clones share
+    /// it across accepted connections, but it does not survive process
+    /// restarts. Supply an application-owned store for durable persistence.
     #[builder(default = None, setter(transform = |x: Arc<dyn PairingStore>| Some(x)))]
     pairing_store: Option<Arc<dyn PairingStore>>,
     /// Whether this client admits unpaired (Sentinel-PSK) playback sessions.
@@ -179,11 +187,17 @@ pub struct ProtocolClientBuilderFields {
     #[builder(default = None, setter(transform = |x: ArtworkState| Some(x)))]
     artwork_state: Option<ArtworkState>,
     /// Declares the `visualizer@v1` role capability (`buffer_capacity`).
-    /// Requires `visualizer_state` for the initial `client/state`.
+    /// Pair this with [`Self::visualizer_state`] to provide the initial
+    /// `client/state` visualizer object; both halves are validated together
+    /// before outbound connection establishment. For
+    /// [`ProtocolClientBuilder::listen`], the TCP listener is bound first and
+    /// each accepted WebSocket is validated when passed to
+    /// [`ProtocolClientBuilder::accept`].
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
     /// The requested visualizer data types, frame-rate cap, and spectrum
     /// configuration, sent in the initial `client/state` visualizer object.
+    /// Pair this with [`Self::visualizer_v1_support`].
     #[builder(default = None, setter(transform = |x: VisualizerState| Some(x)))]
     visualizer_state: Option<VisualizerState>,
     /// Initial top-level availability sent in the first `client/state`.
@@ -338,9 +352,11 @@ impl ProtocolClientBuilder {
             ));
         }
 
+        // The default store is created when the builder is finalized, so this
+        // Arc is shared by every listener clone and accepted connection.
         let store = self
             .pairing_store
-            .unwrap_or_else(|| Arc::new(MemoryPairingStore::new()));
+            .expect("pairing store is resolved when the builder is finalized");
 
         // The visualizer role's stream configuration lives in the
         // `client/state` visualizer object; the server streams nothing until
@@ -446,5 +462,36 @@ impl ProtocolClientBuilder {
             max_encoded_artwork_transfer_bytes: self.max_encoded_artwork_transfer_bytes,
             clock: self.clock,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::crypto::{Identity, Psk};
+    use crate::protocol::pairing::PairingRecord;
+
+    #[test]
+    fn default_pairing_store_is_shared_by_builder_clones() {
+        let builder = ProtocolClientBuilder::builder()
+            .credentials(ClientCredentials::from_parts(
+                Identity::from_secret_bytes([1u8; 32]),
+                Psk::new([2u8; 32]),
+            ))
+            .name("test".to_string())
+            .build();
+        let clone = builder.clone();
+        let first = builder.into_config().unwrap();
+        let second = clone.into_config().unwrap();
+
+        first
+            .store
+            .add_record(PairingRecord {
+                psk: Psk::new([3u8; 32]),
+                server_id: "server".to_string(),
+                used: false,
+            })
+            .unwrap();
+        assert_eq!(second.store.records().len(), 1);
     }
 }

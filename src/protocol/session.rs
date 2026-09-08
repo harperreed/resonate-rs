@@ -9,7 +9,8 @@
 //! with pairing and re-handshake handling — to the message stream of an
 //! established connection. The I/O loop itself (frame decode, channel
 //! routing, task lifecycle) lives in [`client`](crate::protocol::client);
-//! this module owns the protocol decisions.
+//! this module owns the protocol decisions. Pairing-store capacity and
+//! connection-lifetime coordination remain application responsibilities.
 
 use crate::error::Error;
 use crate::protocol::crypto::{
@@ -262,8 +263,11 @@ pub(crate) enum SessionFlow {
     Forward,
     /// Internal protocol traffic; do not forward.
     Consumed,
-    /// The session is over; stop the router loop.
+    /// The session is over due to an immediate protocol/transport failure.
     Close,
+    /// A farewell was queued; keep the router alive until the writer flushes it
+    /// and closes the WebSocket.
+    Farewell,
 }
 
 /// Mutable protocol state of one established session.
@@ -391,7 +395,7 @@ impl SessionState {
                         reason: GoodbyeReason::PairingRequired,
                     }),
                 );
-                SessionFlow::Close
+                SessionFlow::Farewell
             }
             ActivateVerdict::Unauthorized => {
                 enqueue_farewell(
@@ -400,7 +404,7 @@ impl SessionState {
                         reason: GoodbyeReason::Unauthorized,
                     }),
                 );
-                SessionFlow::Close
+                SessionFlow::Farewell
             }
             ActivateVerdict::MethodNotSupported => {
                 // This terminal activation still ends the re-handshake sequence;
@@ -449,7 +453,10 @@ impl SessionState {
                 // The server believes pairing completed and will re-handshake
                 // to the new PSK, which this client cannot honor. Failing the
                 // session now surfaces the storage problem instead of an
-                // opaque re-handshake failure later.
+                // opaque re-handshake failure later. `StorageExhausted` (or
+                // any other persistence error) therefore closes the session;
+                // no farewell is safe here because the peer is about to rotate
+                // keys.
                 log::error!("Failed to persist pairing record: {e:?}; closing session");
                 SessionFlow::Close
             }
@@ -468,7 +475,7 @@ impl SessionState {
                         reason: GoodbyeReason::Unpaired,
                     }),
                 );
-                SessionFlow::Close
+                SessionFlow::Farewell
             }
             // Unpaired session: there is no record to remove; ignore.
             _ => SessionFlow::Consumed,
@@ -516,6 +523,9 @@ impl SessionState {
             }
             let msg2_bytes = handshake.write_message_2(&candidate.psk)?;
             let new_channel = handshake.into_channel()?;
+            // The protocol requires quiescence during this exchange; the
+            // writer encrypts message 2 under the old channel before it
+            // publishes this new channel (see `writer_task`).
             let msg2 = Message::NoiseHandshake(NoiseHandshake {
                 data: b64url_encode(&msg2_bytes),
             });

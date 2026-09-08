@@ -8,6 +8,7 @@
 //! farewell-then-close teardown safe to express as queue commands.
 
 use crate::error::Error;
+use crate::protocol::client::DEFAULT_DISCONNECT_TIMEOUT;
 use crate::protocol::messages::Message;
 use crate::protocol::transport::{frame_type, EncryptedChannel};
 use futures_util::{stream::SplitSink, SinkExt};
@@ -41,7 +42,8 @@ pub(crate) enum WriteCommand {
         new_channel: Box<EncryptedChannel>,
     },
     /// Send a final message (`client/goodbye` or `pair/abort`), close the
-    /// WebSocket, and exit.
+    /// WebSocket, and exit. The complete farewell flush and close operation
+    /// is bounded by `DEFAULT_DISCONNECT_TIMEOUT`.
     Farewell {
         msg: Box<Message>,
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -93,7 +95,7 @@ pub(crate) async fn writer_task<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    while let Some(cmd) = rx.recv().await {
+    'writer: while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::Send { msg, ack } => {
                 let result = send_encrypted(&mut sink, &channel, msg).await;
@@ -105,19 +107,36 @@ pub(crate) async fn writer_task<S>(
                 }
             }
             WriteCommand::Rehandshake { msg2, new_channel } => {
-                // Noise message 2 travels encrypted under the pre-re-handshake
-                // transport keys; everything after uses the new keys.
-                if send_encrypted(&mut sink, &channel, OutboundPayload::Json(msg2))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                // Encrypt message 2 under the pre-re-handshake transport keys
+                // before publishing the new channel. The protocol requires
+                // quiescence during this exchange; publishing only after
+                // encryption preserves the old-key ordering if the peer
+                // receives/responds before the socket send future resolves.
+                let frames = match encrypt_outbound(&channel, &OutboundPayload::Json(msg2)) {
+                    Ok(frames) => frames,
+                    Err(_) => break,
+                };
                 *channel.lock() = *new_channel;
                 log::debug!("Re-handshake complete; transport keys swapped");
+                for frame in frames {
+                    if sink.send(WsMessage::Binary(frame.into())).await.is_err() {
+                        break 'writer;
+                    }
+                }
             }
             WriteCommand::Farewell { msg, ack } => {
-                let _ = ack.send(perform_farewell(&mut sink, &channel, *msg).await);
+                let result = match tokio::time::timeout(
+                    DEFAULT_DISCONNECT_TIMEOUT,
+                    perform_farewell(&mut sink, &channel, *msg),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Connection(format!(
+                        "farewell flush timed out after {DEFAULT_DISCONNECT_TIMEOUT:?}"
+                    ))),
+                };
+                let _ = ack.send(result);
                 break;
             }
         }

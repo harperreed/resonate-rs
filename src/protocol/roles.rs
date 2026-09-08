@@ -12,7 +12,7 @@ use crate::protocol::binary::binary_types;
 use crate::protocol::messages::{
     Activity, ArtworkState, AudioFormatSpec, ClientCommand, ClientState, ClientStreamEnd,
     ClientStreamStart, ControllerCommand, ControllerCommandType, Message, PlayerState, RepeatMode,
-    SourceStreamConfig, StreamEnd, StreamStart, VisualizerState,
+    SourceState, SourceStreamConfig, StreamEnd, StreamStart, VisualizerState,
 };
 use crate::protocol::writer::{OutboundPayload, WriteCommand};
 use parking_lot::RwLock;
@@ -227,13 +227,14 @@ impl SharedSessionState {
     }
 }
 
-/// Cheap to clone. `send_message` returns once the writer has reported the
-/// underlying `sink.send` result, so the `Result` reflects the wire-write
+/// Cheap to clone. Internal message sends return once the writer has reported
+/// the underlying `sink.send` result, so the `Result` reflects the wire-write
 /// outcome rather than queue insertion.
 ///
-/// During an in-band re-handshake, sends wait until the post-re-handshake
-/// `server/activate` arrives (spec: no other messages flow during the
-/// exchange, and the connection resumes with the hello/activate sequence).
+/// During an in-band re-handshake, internal sends wait until the
+/// post-re-handshake `server/activate` arrives (spec: no other messages flow
+/// during the exchange, and the connection resumes with the hello/activate
+/// sequence).
 #[derive(Debug, Clone)]
 pub struct WsSender {
     tx: UnboundedSender<WriteCommand>,
@@ -273,8 +274,12 @@ impl WsSender {
             .map_err(|_| Error::WebSocket("connection closed".to_string()))
     }
 
-    /// Send a message to the server.
-    pub async fn send_message(&self, msg: Message) -> Result<(), Error> {
+    /// Send an already-constructed JSON message through the serialized writer.
+    ///
+    /// This is an internal primitive for implementing the typed APIs and
+    /// protocol housekeeping. Callers should use the public stateful or typed
+    /// role operations, which update canonical state and apply validation.
+    pub(crate) async fn send_message(&self, msg: Message) -> Result<(), Error> {
         self.wait_gate().await?;
         // Time pings go out at 1Hz for as long as the connection lives; keep
         // that housekeeping at trace so debug shows only meaningful traffic.
@@ -465,6 +470,21 @@ impl WsSender {
             .update_client_state(|state| state.visualizer = Some(visualizer));
         self.send_client_state_roles(ClientState {
             visualizer: snapshot.visualizer,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Report the source's full line-sensing state in `client/state`.
+    ///
+    /// This updates only the source role object and preserves the canonical
+    /// availability and state for every other role.
+    pub async fn update_source_state(&self, source: SourceState) -> Result<(), Error> {
+        let snapshot = self
+            .shared
+            .update_client_state(|state| state.source = Some(source));
+        self.send_client_state_roles(ClientState {
+            source: snapshot.source,
             ..Default::default()
         })
         .await
@@ -687,8 +707,13 @@ impl Source {
     }
 
     /// End the current input stream (`client-stream/end`).
+    ///
+    /// This is intentionally allowed after the server removes `source@v1`,
+    /// so an application can finish cleanup for a stream that was already
+    /// active. Repeated calls are sent as repeated cleanup messages.
     pub async fn end_stream(&self) -> Result<(), Error> {
-        self.require_role()?;
+        // The server may remove source@v1 before notifying the application;
+        // cleanup must still be able to send the required end message.
         self.sender
             .send_message(Message::ClientStreamEnd(ClientStreamEnd {}))
             .await

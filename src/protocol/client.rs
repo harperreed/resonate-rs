@@ -306,6 +306,9 @@ struct EstablishedParts {
     session: SessionInfo,
     candidate: PskCandidate,
     server_public: [u8; 32],
+    /// Whether the initial pairing activation was admissible for the pairing
+    /// flow. A method mismatch sends pair/abort and must not start an attempt.
+    start_pairing_attempt: bool,
 }
 
 /// Await the next WebSocket text frame during the cleartext handshake phase.
@@ -580,6 +583,9 @@ impl ProtocolClient {
             activate.active_roles.is_some(),
             pairing_ok,
         );
+        let start_pairing_attempt = verdict == ActivateVerdict::Admissible
+            && activate.activities.contains(&Activity::Pairing)
+            && matches!(candidate.category, PskCategory::Pairing);
         match verdict {
             ActivateVerdict::Admissible => {}
             ActivateVerdict::PairingRequired | ActivateVerdict::Unauthorized => {
@@ -620,6 +626,7 @@ impl ProtocolClient {
             session,
             candidate,
             server_public,
+            start_pairing_attempt,
         })
     }
 
@@ -640,6 +647,7 @@ impl ProtocolClient {
             session,
             candidate,
             server_public,
+            start_pairing_attempt,
         } = parts;
         let SessionConfig {
             identity,
@@ -730,9 +738,10 @@ impl ProtocolClient {
             log::debug!("Sending initial client/state");
             enqueue_json(&out_tx, Message::ClientState(shared.client_state()));
             session_state.state_sent = true;
-        } else if session_state.current.category == PskCategory::Pairing {
-            // Pairing PSK flow: the client starts the attempt by delivering a
-            // freshly generated long-term PSK immediately after server/activate.
+        } else if start_pairing_attempt {
+            // Pairing PSK flow: the client starts the attempt only after an
+            // admissible pairing activation. A method_not_supported response
+            // has already sent pair/abort and must not emit a finalize.
             session_state.start_pairing_attempt(&session_io);
         }
 
@@ -818,6 +827,7 @@ impl ProtocolClient {
         let mut artwork_assembler =
             crate::protocol::binary::ArtworkAssembler::new(max_encoded_artwork_transfer_bytes);
         let mut visualizer_closed = false;
+        let mut farewell_queued = false;
         let mut message_closed = false;
         let mut audio_chunk_count = 0u64;
         let mut audio_dropped_count = 0u64;
@@ -846,11 +856,11 @@ impl ProtocolClient {
                 }
                 _ = tokio::time::sleep_until(
                     pairing_deadline.unwrap_or_else(far_future)
-                ), if pairing_deadline.is_some() => {
+                ), if pairing_deadline.is_some() && !farewell_queued => {
                     session.abort_pairing_attempt_timeout(&session_io);
                     continue;
                 }
-                frame = read.next() => frame,
+                frame = read.next(), if !farewell_queued => frame,
             };
             let Some(msg) = frame else { break };
             match msg {
@@ -903,6 +913,13 @@ impl ProtocolClient {
                                 log::debug!("Received message: {:?}", msg);
                                 match session.handle_json(&msg, &session_io) {
                                     SessionFlow::Close => break 'outer,
+                                    SessionFlow::Farewell => {
+                                        // The writer owns the queued farewell
+                                        // and close. Stop processing all other
+                                        // traffic until its dead signal arrives.
+                                        farewell_queued = true;
+                                        continue;
+                                    }
                                     SessionFlow::Consumed => continue,
                                     SessionFlow::Forward => {}
                                 }
