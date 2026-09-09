@@ -2,7 +2,7 @@
 // ABOUTME: Validates Sendspin protocol binary message types and edge cases
 
 use sendspin::protocol::client::{
-    binary_types, ArtworkChunk, AudioChunk, BinaryFrame, VisualizerChunk,
+    binary_types, ArtworkImage, AudioChunk, BinaryFrame, VisualizerChunk,
 };
 
 // =============================================================================
@@ -64,13 +64,28 @@ fn test_audio_chunk_parsing() {
     let frame: Vec<u8> = vec![
         0x04, // Type: player audio
         0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x42, 0x40, // Timestamp: 1000000
+        0x00, 0x00, 0x00, 0x2A, // Send ahead: 42 us
         0xDE, 0xAD, 0xBE, 0xEF, // Audio data
     ];
 
     let chunk = AudioChunk::from_bytes(&frame).unwrap();
     assert_eq!(chunk.timestamp, 1000000);
+    assert_eq!(chunk.send_ahead, 42);
+    assert_eq!(chunk.send_ahead_us(), Some(42));
     assert_eq!(chunk.data.len(), 4);
     assert_eq!(&*chunk.data, &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn test_audio_send_ahead_saturation_means_unmeasured() {
+    for send_ahead in [0u32, u32::MAX] {
+        let mut frame = vec![0x04];
+        frame.extend_from_slice(&1i64.to_be_bytes());
+        frame.extend_from_slice(&send_ahead.to_be_bytes());
+        let chunk = AudioChunk::from_bytes(&frame).unwrap();
+        assert_eq!(chunk.send_ahead, send_ahead);
+        assert_eq!(chunk.send_ahead_us(), None);
+    }
 }
 
 #[test]
@@ -78,6 +93,7 @@ fn test_audio_chunk_wrong_type() {
     let frame: Vec<u8> = vec![
         0x08, // Wrong type (artwork)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // Timestamp
+        0x00, 0x00, 0x00, 0x00, // Send ahead
         0x00, // Data
     ];
 
@@ -87,7 +103,7 @@ fn test_audio_chunk_wrong_type() {
 
 #[test]
 fn test_audio_chunk_too_short() {
-    let frame: Vec<u8> = vec![0x04, 0x00, 0x00]; // Only 3 bytes
+    let frame: Vec<u8> = vec![0x04, 0x00, 0x00]; // Too short
     let result = AudioChunk::from_bytes(&frame);
     assert!(result.is_err());
 }
@@ -102,10 +118,11 @@ fn test_audio_chunk_boundary_8_bytes() {
 
 #[test]
 fn test_audio_chunk_minimum_valid() {
-    // Exactly 9 bytes - minimum valid frame (no data)
+    // Exactly 13 bytes - minimum valid frame (no data)
     let frame: Vec<u8> = vec![
         0x04, // Type
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // Timestamp: 1
+        0x00, 0x00, 0x00, 0x00, // Send ahead: not measured
     ];
     let chunk = AudioChunk::from_bytes(&frame).unwrap();
     assert_eq!(chunk.timestamp, 1);
@@ -117,6 +134,7 @@ fn test_audio_chunk_negative_timestamp() {
     let frame: Vec<u8> = vec![
         0x04, // Type
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Timestamp: -1
+        0xFF, 0xFF, 0xFF, 0xFF, // Send ahead: not measured
         0x00, // Data
     ];
     let chunk = AudioChunk::from_bytes(&frame).unwrap();
@@ -128,58 +146,21 @@ fn test_audio_chunk_negative_timestamp() {
 // =============================================================================
 
 #[test]
-fn test_artwork_chunk_channel_0() {
-    let frame: Vec<u8> = vec![
-        0x08, // Type: artwork channel 0
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8, // Timestamp: 1000
-        0xFF, 0xD8, 0xFF, 0xE0, // JPEG magic bytes
-    ];
-
-    let chunk = ArtworkChunk::from_bytes(&frame).unwrap();
-    assert_eq!(chunk.channel, 0);
-    assert_eq!(chunk.timestamp, 1000);
-    assert_eq!(chunk.data.len(), 4);
-    assert!(!chunk.is_clear());
-}
-
-#[test]
-fn test_artwork_chunk_channel_3() {
-    let frame: Vec<u8> = vec![
-        0x0B, // Type: artwork channel 3
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xD0, // Timestamp: 2000
-        0x89, 0x50, 0x4E, 0x47, // PNG magic bytes
-    ];
-
-    let chunk = ArtworkChunk::from_bytes(&frame).unwrap();
-    assert_eq!(chunk.channel, 3);
-    assert_eq!(chunk.timestamp, 2000);
-}
-
-#[test]
-fn test_artwork_chunk_clear() {
-    // Empty payload = clear artwork
-    let frame: Vec<u8> = vec![
-        0x09, // Type: artwork channel 1
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, // Timestamp: 0
-              // No data - clear command
-    ];
-
-    let chunk = ArtworkChunk::from_bytes(&frame).unwrap();
-    assert_eq!(chunk.channel, 1);
-    assert!(chunk.is_clear());
-    assert!(chunk.data.is_empty());
-}
-
-#[test]
-fn test_artwork_chunk_wrong_type() {
-    let frame: Vec<u8> = vec![
-        0x04, // Wrong type (audio)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-    ];
-
-    let result = ArtworkChunk::from_bytes(&frame);
-    assert!(result.is_err());
+fn test_artwork_image_and_clear_contract() {
+    let image = ArtworkImage {
+        channel: 0,
+        timestamp: 1000,
+        data: std::sync::Arc::from(&[0xFF, 0xD8][..]),
+    };
+    assert_eq!(image.channel, 0);
+    assert_eq!(image.timestamp, 1000);
+    assert!(!image.is_clear());
+    let clear = ArtworkImage {
+        channel: 1,
+        timestamp: 0,
+        data: std::sync::Arc::from(&[][..]),
+    };
+    assert!(clear.is_clear());
 }
 
 // =============================================================================
@@ -191,7 +172,7 @@ fn test_visualizer_chunk_parsing() {
     let frame: Vec<u8> = vec![
         0x10, // Loudness
         0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86, 0xA0, // Timestamp: 100000
-        0x01, 0x02, 0x03, 0x04, 0x05, // Raw visualization data
+        0x01, 0x02, // Loudness payload (u16)
     ];
 
     let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
@@ -201,7 +182,7 @@ fn test_visualizer_chunk_parsing() {
         Some(sendspin::protocol::messages::VisualizerDataType::Loudness)
     );
     assert_eq!(chunk.timestamp, 100000);
-    assert_eq!(&*chunk.data, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+    assert_eq!(&*chunk.data, &[0x01, 0x02]);
 }
 
 #[test]
@@ -213,12 +194,31 @@ fn test_all_visualizer_types_are_accepted() {
         sendspin::protocol::messages::VisualizerDataType::Spectrum,
         sendspin::protocol::messages::VisualizerDataType::Peak,
     ];
-    for (type_id, expected_type) in (0x10..=0x14).zip(expected) {
-        let frame = [type_id, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
+    let payloads: [&[u8]; 5] = [
+        &[0xAA, 0xBB],
+        &[0xAA],
+        &[0, 0, 0, 1],
+        &[0xAA, 0xBB],
+        &[0xAA],
+    ];
+    for ((type_id, expected_type), data) in (0x10..=0x14).zip(expected).zip(payloads) {
+        let mut frame = vec![type_id, 0, 0, 0, 0, 0, 0, 0, 1];
+        frame.extend_from_slice(data);
         let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
         assert_eq!(chunk.type_id, type_id);
         assert_eq!(chunk.data_type(), Some(expected_type));
-        assert_eq!(&*chunk.data, &[0xAA]);
+        assert_eq!(&*chunk.data, data);
+    }
+}
+
+#[test]
+fn test_visualizer_type_specific_lengths_are_enforced() {
+    let timestamp = 1i64.to_be_bytes();
+    for (type_id, length) in [(0x10, 1usize), (0x11, 2), (0x12, 3), (0x13, 1), (0x14, 2)] {
+        let mut frame = vec![type_id];
+        frame.extend_from_slice(&timestamp);
+        frame.extend(std::iter::repeat_n(0xAA, length));
+        assert!(VisualizerChunk::from_bytes(&frame).is_err());
     }
 }
 
@@ -241,17 +241,15 @@ fn test_visualizer_chunk_wrong_type() {
 
 #[test]
 fn test_visualizer_chunk_minimum_valid() {
-    // Exactly 9 bytes — type byte + 8-byte timestamp with no FFT payload —
-    // is the smallest legal visualizer frame and must parse successfully.
-    // This is the lower bound of the length guard; a frame of exactly 9
-    // bytes is *valid*, not too-short.
+    // Visualizer payloads are type-specific; a loudness frame needs 2 bytes.
     let frame: Vec<u8> = vec![
-        0x10, // Type: visualizer
+        0x10, // Type: visualizer loudness
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, // Timestamp: 42
+        0x00, 0x01,
     ];
     let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
     assert_eq!(chunk.timestamp, 42);
-    assert!(chunk.data.is_empty());
+    assert_eq!(&*chunk.data, &[0, 1]);
 }
 
 #[test]
@@ -272,7 +270,7 @@ fn test_visualizer_chunk_too_short() {
 fn test_binary_frame_audio() {
     let frame: Vec<u8> = vec![
         0x04, // Audio
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAB, 0xCD,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xAB, 0xCD,
     ];
 
     match BinaryFrame::from_bytes(&frame).unwrap() {
@@ -284,18 +282,14 @@ fn test_binary_frame_audio() {
 }
 
 #[test]
-fn test_binary_frame_artwork() {
-    let frame: Vec<u8> = vec![
-        0x0A, // Artwork channel 2
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x12, 0x34,
-    ];
-
+fn test_binary_frame_artwork_is_unknown_without_assembler() {
+    let frame: Vec<u8> = vec![0x0A, 0x00, 0x12, 0x34];
     match BinaryFrame::from_bytes(&frame).unwrap() {
-        BinaryFrame::Artwork(chunk) => {
-            assert_eq!(chunk.channel, 2);
-            assert_eq!(chunk.timestamp, 2);
+        BinaryFrame::Unknown { type_id, data } => {
+            assert_eq!(type_id, 0x0A);
+            assert_eq!(&*data, &[0x00, 0x12, 0x34]);
         }
-        _ => panic!("Expected Artwork frame"),
+        _ => panic!("Expected artwork to be routed through assembler"),
     }
 }
 

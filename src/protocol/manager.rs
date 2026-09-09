@@ -3,40 +3,87 @@
 
 use crate::error::Error;
 use crate::protocol::client::{
-    ArtworkChunk, AudioChunk, Connection, ConnectionGuard, Controller, VisualizerChunk, WsSender,
+    ArtworkMessage, AudioChunk, Connection, ConnectionGuard, Controller, SessionInfo, Source,
+    VisualizerChunk, WsSender,
 };
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ConnectionReason, GoodbyeReason, Message, PlayerState, ServerHello,
+    Activity, ClientGoodbye, GoodbyeReason, Message, PairAbort, PairAbortReason, PlayerState,
 };
+use crate::protocol::session::activity_rank;
 use crate::sync::ClockSync;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
+
+/// The live facts about the current (incumbent) connection that multi-server
+/// arbitration compares against. Obtained from
+/// [`ConnectionGuard::arbitration_state`]; the activities track the *latest*
+/// `server/activate` (spec: servers drop activities as purposes end, and
+/// admission is decided on the declared set).
+#[derive(Debug, Clone)]
+pub struct ArbitrationState {
+    /// The incumbent server's identity.
+    pub server_id: String,
+    /// Activities from the incumbent's latest admissible `server/activate`.
+    pub activities: Vec<Activity>,
+    /// Whether a pairing attempt is in progress on the incumbent connection.
+    /// Spec: a pairing attempt is not displaced by an incoming `'playback'`
+    /// or `'pairing'` connection.
+    pub pairing_attempt_in_progress: bool,
+}
 
 /// The spec's multi-server arbitration rule: should the newly established
 /// `candidate` displace the `current` server?
 ///
 /// [`ConnectionManager`] applies this automatically; it is public so
 /// applications running their own [`ProtocolListener::accept`] loop can make
-/// the identical decision.
+/// the identical decision (build `current` via
+/// [`ConnectionGuard::arbitration_state`]).
 pub fn should_switch(
-    current: &ServerHello,
-    candidate: &ServerHello,
+    current: &ArbitrationState,
+    candidate: &SessionInfo,
     last_played: Option<&str>,
 ) -> bool {
-    // Matched as (candidate, current) — reverse of the parameter order —
-    // so the new server reads first in each arm.
-    match (&candidate.connection_reason, &current.connection_reason) {
-        (ConnectionReason::Playback, _) => true,
-        (ConnectionReason::Discovery, ConnectionReason::Playback) => false,
-        (ConnectionReason::Discovery, ConnectionReason::Discovery) => {
-            matches!(last_played, Some(lp) if candidate.server_id == lp)
-        }
+    // Connections are ranked by their highest-ranked declared activity:
+    // playback > pairing > empty. Higher or equal is accepted.
+    let candidate_rank = activity_rank(&candidate.initial_activities);
+    let current_rank = activity_rank(&current.activities);
+    // Exception: an in-progress pairing attempt is not displaced by an
+    // incoming 'playback' or 'pairing' connection.
+    if current.pairing_attempt_in_progress && candidate_rank <= activity_rank(&[Activity::Playback])
+    {
+        return false;
+    }
+    if candidate_rank != current_rank {
+        return candidate_rank > current_rank;
+    }
+    // Both-empty exception: the incoming connection is admitted only when its
+    // server_id matches the last-playback server and the existing one's does
+    // not; otherwise the existing connection is kept.
+    if candidate_rank == 0 {
+        return matches!(
+            last_played,
+            Some(lp) if candidate.server_id == lp && current.server_id != lp
+        );
+    }
+    true
+}
+
+/// The spec farewell for an arbitration loser: `pair/abort
+/// (concurrent_attempt)` when the losing connection is a pairing handshake,
+/// otherwise `client/goodbye` with `reason`.
+fn loser_farewell(activities: &[Activity], reason: GoodbyeReason) -> Message {
+    if activities.contains(&Activity::Pairing) {
+        Message::PairAbort(PairAbort {
+            reason: PairAbortReason::ConcurrentAttempt,
+        })
+    } else {
+        Message::ClientGoodbye(ClientGoodbye { reason })
     }
 }
 
@@ -83,14 +130,14 @@ impl Default for ManagerConfig {
 /// with the manager: the manager must retain teardown authority so it can
 /// send `client/goodbye (another_server)` to a displaced incumbent.
 pub struct ManagedConnection {
-    /// JSON protocol messages from the server.
-    pub messages: UnboundedReceiver<Message>,
-    /// Audio chunks from the server.
-    pub audio: UnboundedReceiver<AudioChunk>,
-    /// Artwork chunks from the server.
-    pub artwork: UnboundedReceiver<ArtworkChunk>,
-    /// Visualizer chunks from the server.
-    pub visualizer: UnboundedReceiver<VisualizerChunk>,
+    /// JSON protocol messages from the server (bounded; drain promptly).
+    pub messages: Receiver<Message>,
+    /// Audio chunks from the server (bounded with drop-on-full).
+    pub audio: Receiver<AudioChunk>,
+    /// Artwork events from the server (bounded with drop-on-full).
+    pub artwork: Receiver<ArtworkMessage>,
+    /// Visualizer chunks from the server (bounded with drop-on-full).
+    pub visualizer: Receiver<VisualizerChunk>,
     /// Clock synchronization state. Fresh per connection: audio components
     /// built around it (e.g. `SyncedPlayer`) must be rebuilt per connection.
     pub clock_sync: Arc<Mutex<ClockSync>>,
@@ -98,8 +145,10 @@ pub struct ManagedConnection {
     pub sender: WsSender,
     /// Controller handle, if the server granted the `controller@v1` role.
     pub controller: Option<Controller>,
-    /// The `server/hello` received during handshake.
-    pub server_hello: ServerHello,
+    /// Source handle, if the server granted the `source@v1` role.
+    pub source: Option<Source>,
+    /// Session facts established during the handshake.
+    pub session: SessionInfo,
     /// Peer address of the winning connection.
     pub peer: SocketAddr,
 }
@@ -126,7 +175,7 @@ enum Command {
 /// the application is still consuming.
 struct Incumbent {
     guard: ConnectionGuard,
-    server_hello: ServerHello,
+    session: SessionInfo,
     peer: SocketAddr,
 }
 
@@ -155,10 +204,11 @@ struct Incumbent {
 /// shutdown.
 ///
 /// ```no_run
-/// # use sendspin::{ConnectionManager, ProtocolClientBuilder};
+/// # use sendspin::{ClientCredentials, ConnectionManager, ProtocolClientBuilder};
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let credentials = ClientCredentials::generate()?;
 /// let listener = ProtocolClientBuilder::builder()
-///     .client_id(uuid::Uuid::new_v4().to_string())
+///     .credentials(credentials)
 ///     .name("Kitchen Speaker".to_string())
 ///     .build()
 ///     .listen("0.0.0.0:8927")
@@ -375,7 +425,7 @@ async fn driver(
                 let inc = current.take().expect("closed() only fires with an incumbent");
                 log::info!(
                     "Server {} ({}) disconnected; awaiting next server",
-                    inc.server_hello.server_id,
+                    inc.session.server_id,
                     inc.peer
                 );
             }
@@ -395,9 +445,11 @@ async fn driver(
                             // stall arbitration; the caller still gets the
                             // real result via the ack.
                             Some(inc) => {
+                                let farewell =
+                                    Message::ClientGoodbye(ClientGoodbye { reason });
                                 goodbyes.spawn(async move {
                                     let _ = ack.send(
-                                        flush_goodbye(inc.guard, reason, goodbye_timeout).await,
+                                        flush_farewell(inc.guard, farewell, goodbye_timeout).await,
                                     );
                                 });
                             }
@@ -412,23 +464,16 @@ async fn driver(
     }
 }
 
-/// Flush `client/goodbye` with a deadline: a peer that stops reading must
-/// not pin the flush — and the connection's tasks and socket — until the OS
-/// TCP timeout. On elapse the guard is dropped, aborting the connection.
-async fn flush_goodbye(
+/// Flush a farewell (`client/goodbye` or `pair/abort`) with a deadline: a
+/// peer that stops reading must not pin the flush — and the connection's
+/// tasks and socket — until the OS TCP timeout. On elapse the guard is
+/// dropped, aborting the connection.
+async fn flush_farewell(
     guard: ConnectionGuard,
-    reason: GoodbyeReason,
+    farewell: Message,
     deadline: Duration,
 ) -> Result<(), Error> {
-    match tokio::time::timeout(deadline, guard.disconnect(reason.clone())).await {
-        Ok(result) => result,
-        Err(_) => {
-            log::warn!("client/goodbye ({reason:?}) flush timed out; connection aborted");
-            Err(Error::Connection(
-                "client/goodbye flush timed out; connection aborted".to_string(),
-            ))
-        }
-    }
+    guard.farewell(farewell, deadline).await
 }
 
 /// Apply [`should_switch`] to a freshly established connection: promote it
@@ -450,46 +495,51 @@ fn arbitrate(
         let dead = current.take().expect("checked Some above");
         log::info!(
             "Server {} ({}) already disconnected; arbitration proceeds without it",
-            dead.server_hello.server_id,
+            dead.session.server_id,
             dead.peer
         );
     }
 
     if let Some(inc) = current.as_ref() {
-        if !should_switch(&inc.server_hello, &conn.server_hello, last_played) {
+        if !should_switch(&inc.guard.arbitration_state(), &conn.session, last_played) {
+            // A rejected incoming connection receives goodbye
+            // 'concurrent_attempt' — or pair/abort (concurrent_attempt) when
+            // it is a pairing handshake (spec: Multiple servers).
             log::info!(
-                "Keeping server {} — rejecting {} ({peer}) with goodbye(another_server)",
-                inc.server_hello.server_id,
-                conn.server_hello.server_id,
+                "Keeping server {} — rejecting {} ({peer}) as concurrent_attempt",
+                inc.session.server_id,
+                conn.session.server_id,
+            );
+            let farewell = loser_farewell(
+                &conn.guard.arbitration_state().activities,
+                GoodbyeReason::ConcurrentAttempt,
             );
             // Spawned so a slow flush can't stall arbitration; dropping the
             // rest of `conn` closes its channels.
             goodbyes.spawn(async move {
-                let _ =
-                    flush_goodbye(conn.guard, GoodbyeReason::AnotherServer, goodbye_timeout).await;
+                let _ = flush_farewell(conn.guard, farewell, goodbye_timeout).await;
             });
             return;
         }
 
         let displaced = current.take().expect("checked Some above");
         log::info!(
-            "Switching {} -> {} — goodbye(another_server) to displaced server",
-            displaced.server_hello.server_id,
-            conn.server_hello.server_id,
+            "Switching {} -> {} — farewell(another_server) to displaced server",
+            displaced.session.server_id,
+            conn.session.server_id,
+        );
+        let farewell = loser_farewell(
+            &displaced.guard.arbitration_state().activities,
+            GoodbyeReason::AnotherServer,
         );
         goodbyes.spawn(async move {
-            let _ = flush_goodbye(
-                displaced.guard,
-                GoodbyeReason::AnotherServer,
-                goodbye_timeout,
-            )
-            .await;
+            let _ = flush_farewell(displaced.guard, farewell, goodbye_timeout).await;
         });
     } else {
         log::info!(
-            "Server {} ({peer}) connected (reason: {:?})",
-            conn.server_hello.server_id,
-            conn.server_hello.connection_reason,
+            "Server {} ({peer}) connected (activities: {:?})",
+            conn.session.server_id,
+            conn.session.initial_activities,
         );
     }
 
@@ -501,13 +551,14 @@ fn arbitrate(
         clock_sync,
         sender,
         controller,
-        server_hello,
+        source,
+        session,
         guard,
     } = conn;
 
     *current = Some(Incumbent {
         guard,
-        server_hello: server_hello.clone(),
+        session: session.clone(),
         peer,
     });
 
@@ -521,7 +572,8 @@ fn arbitrate(
         clock_sync,
         sender,
         controller,
-        server_hello,
+        source,
+        session,
         peer,
     });
 }
@@ -529,57 +581,108 @@ fn arbitrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::crypto::CipherSuite;
+    use crate::protocol::messages::Activity;
 
-    fn hello(server_id: &str, reason: ConnectionReason) -> ServerHello {
-        ServerHello {
+    fn session(server_id: &str, activities: Vec<Activity>) -> SessionInfo {
+        SessionInfo {
             server_id: server_id.to_string(),
-            name: format!("{server_id} name"),
-            version: 1,
-            active_roles: vec![],
-            connection_reason: reason,
+            server_name: format!("{server_id} name"),
+            paired: false,
+            suite: CipherSuite::ChaChaPoly,
+            initial_activities: activities,
+            initial_active_roles: vec![],
         }
     }
 
-    // ConnectionManager::should_switch_to_new_server.
-
-    #[test]
-    fn playback_candidate_always_wins() {
-        let current = hello("a", ConnectionReason::Playback);
-        let candidate = hello("b", ConnectionReason::Playback);
-        assert!(should_switch(&current, &candidate, None));
-
-        let current = hello("a", ConnectionReason::Discovery);
-        assert!(should_switch(&current, &candidate, None));
-
-        // Even when the incumbent is the last-played server.
-        assert!(should_switch(&current, &candidate, Some("a")));
+    fn state(server_id: &str, activities: Vec<Activity>) -> ArbitrationState {
+        ArbitrationState {
+            server_id: server_id.to_string(),
+            activities,
+            pairing_attempt_in_progress: false,
+        }
     }
 
     #[test]
-    fn discovery_never_displaces_playback() {
-        let current = hello("a", ConnectionReason::Playback);
-        let candidate = hello("b", ConnectionReason::Discovery);
+    fn higher_or_equal_rank_wins() {
+        // playback displaces playback (equal rank: incoming accepted)
+        let current = state("a", vec![Activity::Playback]);
+        let candidate = session("b", vec![Activity::Playback]);
+        assert!(should_switch(&current, &candidate, None));
+
+        // playback displaces pairing
+        let current = state("a", vec![Activity::Pairing]);
+        let candidate = session("b", vec![Activity::Playback]);
+        assert!(should_switch(&current, &candidate, None));
+
+        // playback displaces empty
+        let current = state("a", vec![]);
+        let candidate = session("b", vec![Activity::Playback]);
+        assert!(should_switch(&current, &candidate, None));
+    }
+
+    #[test]
+    fn lower_rank_never_displaces() {
+        let current = state("a", vec![Activity::Playback]);
+        let candidate = session("b", vec![]);
         assert!(!should_switch(&current, &candidate, None));
-        // Even when the candidate is the last-played server.
+        // Not even when the candidate is the last-playback server.
         assert!(!should_switch(&current, &candidate, Some("b")));
+
+        let current = state("a", vec![Activity::Playback]);
+        let candidate = session("b", vec![Activity::Pairing]);
+        assert!(!should_switch(&current, &candidate, None));
     }
 
     #[test]
-    fn both_discovery_prefers_last_played() {
-        let current = hello("a", ConnectionReason::Discovery);
-        let candidate = hello("b", ConnectionReason::Discovery);
-
+    fn both_empty_prefers_last_playback_server() {
+        let current = state("a", vec![]);
+        let candidate = session("b", vec![]);
         assert!(should_switch(&current, &candidate, Some("b")));
+        assert!(!should_switch(&current, &candidate, Some("a")));
+        assert!(!should_switch(&current, &candidate, None));
+        assert!(!should_switch(&current, &candidate, Some("c")));
+    }
+
+    #[test]
+    fn both_empty_keeps_existing_when_it_matches_last_playback() {
+        // "and the existing one's does not": if the existing connection is
+        // already the last-playback server, keep it.
+        let current = state("a", vec![]);
+        let candidate = session("a", vec![]);
         assert!(!should_switch(&current, &candidate, Some("a")));
     }
 
     #[test]
-    fn both_discovery_defaults_to_keep() {
-        let current = hello("a", ConnectionReason::Discovery);
-        let candidate = hello("b", ConnectionReason::Discovery);
+    fn pairing_attempt_is_not_displaced_by_playback_or_pairing() {
+        let mut current = state("a", vec![Activity::Pairing]);
+        current.pairing_attempt_in_progress = true;
 
-        assert!(!should_switch(&current, &candidate, None));
-        // Last-played matches neither: keep.
-        assert!(!should_switch(&current, &candidate, Some("c")));
+        // Neither playback nor another pairing displaces an in-progress
+        // pairing attempt, despite outranking or equalling it.
+        let playback = session("b", vec![Activity::Playback]);
+        assert!(!should_switch(&current, &playback, None));
+        let pairing = session("b", vec![Activity::Pairing]);
+        assert!(!should_switch(&current, &pairing, None));
+
+        // Without an in-progress attempt, normal ranking applies.
+        current.pairing_attempt_in_progress = false;
+        assert!(should_switch(&current, &playback, None));
+    }
+
+    #[test]
+    fn loser_farewell_picks_pair_abort_for_pairing_handshakes() {
+        assert!(matches!(
+            loser_farewell(&[Activity::Pairing], GoodbyeReason::ConcurrentAttempt),
+            Message::PairAbort(PairAbort {
+                reason: PairAbortReason::ConcurrentAttempt
+            })
+        ));
+        assert!(matches!(
+            loser_farewell(&[Activity::Playback], GoodbyeReason::AnotherServer),
+            Message::ClientGoodbye(ClientGoodbye {
+                reason: GoodbyeReason::AnotherServer
+            })
+        ));
     }
 }

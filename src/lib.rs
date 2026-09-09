@@ -20,8 +20,13 @@ pub mod sync;
 pub(crate) mod log_sampling;
 
 pub use audio::GainControl;
-pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
+pub use protocol::client::{
+    Connection, ConnectionGuard, Controller, ProtocolClient, SessionInfo, Source, WsSender,
+};
 pub use protocol::client_builder::ProtocolClientBuilder;
+pub use protocol::crypto::{
+    CipherSuite, ClientCredentials, Identity, Psk, PskCandidate, PskCategory,
+};
 pub use protocol::listener::ProtocolListener;
 pub use protocol::manager::{ConnectionManager, ManagedConnection, ManagerConfig};
 pub use protocol::messages::ServerHello;
@@ -56,5 +61,9 @@ pub mod error {
         /// Audio output error
         #[error("Audio output error: {0}")]
         Output(String),
+
+        /// Cryptographic error (identity, PSK, or Noise handshake/transport)
+        #[error("Crypto error: {0}")]
+        Crypto(String),
     }
 }

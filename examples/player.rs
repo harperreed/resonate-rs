@@ -6,10 +6,10 @@ use clap::{Parser, ValueEnum};
 use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState,
-    PlayerStateCommand, PlayerV1Support,
+    AudioFormatSpec, Message, PlayerCommand, PlayerCommandType, PlayerState, PlayerStateCommand,
+    PlayerV1Support,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -128,10 +128,6 @@ struct Args {
     #[arg(short, long, default_value = "Sendspin-RS Player")]
     name: String,
 
-    /// Player ID (optional, generates random UUID if not provided)
-    #[arg(short = 'i', long = "id")]
-    id: Option<String>,
-
     /// Restrict negotiation to one codec (pcm, opus, or flac)
     #[arg(long, value_enum)]
     codec: Option<CodecChoice>,
@@ -173,9 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Use provided ID or generate a random UUID
-    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
+    // This example generates fresh credentials on every run. A real
+    // application should persist credentials.to_bytes() in application-owned
+    // secure storage and restore them with ClientCredentials::from_bytes() on
+    // the next launch.
+    let credentials = ClientCredentials::generate()?;
     println!("Connecting to {}...", args.server);
     let required_lead_time_ms = 500;
     let min_buffer_ms = 500;
@@ -206,20 +204,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let test = ProtocolClientBuilder::builder()
-        .client_id(client_id)
+        .credentials(credentials)
         .name(args.name.clone())
         .player_v1_support(PlayerV1Support {
             supported_formats,
             buffer_capacity: 50 * 1024 * 1024,
-            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         })
         .initial_player_state(PlayerState {
             volume: Some(100),
             muted: Some(false),
-            static_delay_ms: Some(0),
-            required_lead_time_ms: Some(required_lead_time_ms),
-            min_buffer_ms: Some(min_buffer_ms),
-            supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
+            output_delay_ms: 0,
+            required_lead_time_ms,
+            min_buffer_ms,
+            supported_commands: vec![
+                PlayerStateCommand::Volume,
+                PlayerStateCommand::Mute,
+                PlayerStateCommand::SetOutputDelay,
+            ],
+            format: None,
         })
         .build();
 
@@ -262,25 +264,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = message_rx.recv() => {
                 match msg {
                     Message::StreamStart(stream_start) => {
-                        // Demonstrate `stream/request-format`: now that the player
-                        // stream is live, ask the server to re-encode it (here,
-                        // lighter 16-bit PCM this example can still decode).
-                        // One-shot, so the server's responding stream/start
-                        // doesn't re-trigger it.
+                        // Demonstrate the client/state format preference: now
+                        // that the player stream is live, report a preferred
+                        // format (lighter 16-bit PCM this example can still
+                        // decode); the server re-derives the stream and sends
+                        // a new stream/start if it changed. One-shot, so the
+                        // server's responding stream/start doesn't re-trigger.
                         if env_bool("SS_REQUEST_FORMAT")
                             && !format_requested
                             && stream_start.player.is_some()
                         {
                             format_requested = true;
                             sender
-                                .request_player_format(PlayerFormatRequest {
-                                    codec: Some("pcm".to_string()),
-                                    channels: Some(2),
-                                    sample_rate: Some(48_000),
-                                    bit_depth: Some(16),
-                                })
+                                .set_player_format(Some(AudioFormatSpec {
+                                    codec: "pcm".to_string(),
+                                    channels: 2,
+                                    sample_rate: 48_000,
+                                    bit_depth: 16,
+                                }))
                                 .await?;
-                            println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
+                            println!("Preferred 16-bit PCM stereo @ 48kHz via client/state format");
                         }
 
                         if let Some(ref player_config) = stream_start.player {
@@ -427,14 +430,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Message::ServerCommand(command) => {
                         if let Some(PlayerCommand {
-                            command: PlayerCommandType::SetStaticDelay,
-                            static_delay_ms: Some(delay_ms),
+                            command: PlayerCommandType::SetOutputDelay,
+                            output_delay_ms: Some(delay_ms),
                             ..
                         }) = command.player
                         {
                             static_delay_ms = delay_ms;
                             if let Some(ref player) = synced_player {
-                                player.set_static_delay(delay_ms);
+                                player.set_output_delay(delay_ms);
                             }
                             println!("Static delay set to {delay_ms} ms");
                         }
@@ -539,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
-                                        player.set_static_delay(static_delay_ms);
+                                        player.set_output_delay(static_delay_ms);
                                         synced_player = Some(player);
                                     }
                                     Err(e) => {

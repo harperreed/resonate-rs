@@ -6,7 +6,7 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{Message, PlaybackState};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 
 /// Sendspin metadata client using the managed inbound listener
 #[derive(Parser, Debug)]
@@ -19,10 +19,6 @@ struct Args {
     /// Friendly name advertised in the mDNS TXT record
     #[arg(short, long, default_value = "Metadata Listener")]
     name: String,
-
-    /// Persistent client id (defaults to a random UUID)
-    #[arg(short, long)]
-    id: Option<String>,
 }
 
 #[tokio::main]
@@ -30,10 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args = Args::parse();
-    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
+    // This example generates fresh credentials on every run. A real
+    // application should persist credentials.to_bytes() in application-owned
+    // secure storage and restore them with ClientCredentials::from_bytes() on
+    // the next launch.
+    let credentials = ClientCredentials::generate()?;
     let listener = ProtocolClientBuilder::builder()
-        .client_id(client_id)
+        .credentials(credentials)
         .name(args.name.clone())
         .metadata()
         .build()
@@ -69,10 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replacement.
     while let Some(mut conn) = manager.next_connection().await {
         let peer = conn.peer;
-        let server_id = conn.server_hello.server_id.clone();
+        let server_id = conn.session.server_id.clone();
         println!(
-            "[{peer}] now serving server_id={server_id} connection_reason={:?}",
-            conn.server_hello.connection_reason
+            "[{peer}] now serving server_id={server_id} paired={} activities={:?}",
+            conn.session.paired, conn.session.initial_activities
         );
 
         // Only `messages` is consumed: this client negotiates just the
@@ -80,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // silent and can be ignored. A player would drain those too.
         while let Some(msg) = conn.messages.recv().await {
             match msg {
-                Message::GroupUpdate(g) if g.playback_state == Some(PlaybackState::Playing) => {
+                Message::GroupUpdate(g) if g.playback_state == PlaybackState::Playing => {
                     // Feed the policy input back so a returning server wins
                     // discovery ties. A spec-compliant client would also
                     // persist this to disk here.

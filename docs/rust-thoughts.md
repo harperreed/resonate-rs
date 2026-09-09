@@ -1,4 +1,11 @@
-# Resonate-RS: Hyper-Efficient Rust Implementation Specification
+# Historical Resonate-RS Implementation Design
+
+> **Historical note:** This document contains early Resonate/Sendspin design
+> sketches and is not current protocol documentation. The current implementation
+> uses the Sendspin `/sendspin` WebSocket endpoint, mandatory Noise `KKpsk2`,
+> Curve25519 public-key identities, encrypted application messages, and the
+> `client/init`/`server/init` handshake. See the Rust API docs, `src/protocol`,
+> and `examples/` for the authoritative implementation.
 
 **Version:** 1.0
 **Date:** 2025-10-25

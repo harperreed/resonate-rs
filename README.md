@@ -55,21 +55,25 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sendspin = "0.1"
+sendspin = "0.3.6"
 ```
 
 ### Basic Client Example
 
 ```rust
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ClientCredentials, ProtocolClientBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load these bytes from application-owned secure storage in a real app.
+    // Store credentials.to_bytes() before connecting and restore with
+    // ClientCredentials::from_bytes() on the next launch.
+    let credentials = ClientCredentials::generate()?;
     let client = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
+        .credentials(credentials)
         .name("My Player".to_string())
         .build()
-        .connect("ws://localhost:8080/sendspin")
+        .connect("ws://localhost:8927/sendspin")
         .await?;
 
     // Client is now connected and ready to receive audio
@@ -82,7 +86,9 @@ See `examples/` directory for more examples.
 
 ## Architecture
 
-See [docs/rust-thoughts.md](docs/rust-thoughts.md) for detailed architecture and implementation notes.
+The current protocol implementation is documented in the public Rust API and the
+examples. [docs/rust-thoughts.md](docs/rust-thoughts.md) is retained as a
+historical design note; its early protocol sketches are not normative.
 
 ## Development
 
